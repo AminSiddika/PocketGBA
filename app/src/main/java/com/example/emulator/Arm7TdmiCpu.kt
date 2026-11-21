@@ -108,13 +108,15 @@ class Arm7TdmiCpu(
         if (mmu.halted) {
             return 16
         }
-        checkIrq()
+        if ((cpsr and FLAG_I) == 0 && mmu.irqPendingFast) {
+            checkIrq()
+        }
         val cycles = if ((cpsr and FLAG_T) != 0) {
-            val op = mmu.read16(r[15])
+            val op = mmu.fetch16(r[15])
             r[15] += 2
             ThumbExecutor.execute(this, op)
         } else {
-            val op = mmu.read32(r[15])
+            val op = mmu.fetch32(r[15])
             r[15] += 4
             executeArm(op)
         }

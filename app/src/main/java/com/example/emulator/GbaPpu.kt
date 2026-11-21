@@ -1,6 +1,15 @@
 package com.example.emulator
 
 class GbaPpu(private val mmu: GbaMmu) {
+    companion object {
+        private val RGB555_LUT = IntArray(32768) { c ->
+            val r = ((c and 0x1F) * 255) / 31
+            val g = (((c ushr 5) and 0x1F) * 255) / 31
+            val b = (((c ushr 10) and 0x1F) * 255) / 31
+            (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+    }
+
     val frameBuffer = IntArray(GbaConstants.PIXEL_COUNT)
 
     private val bgColors = IntArray(GbaConstants.SCREEN_WIDTH)
@@ -130,39 +139,53 @@ class GbaPpu(private val mmu: GbaMmu) {
         val sizeMode = (bgCnt ushr 14) and 3
         val widthPx = if ((sizeMode and 1) != 0) 512 else 256
         val heightPx = if ((sizeMode and 2) != 0) 512 else 256
+        val widthMask = widthPx - 1
 
         val hofs = mmu.readIo16Raw(0x010 + bg * 4) and 0x1FF
         val vofs = mmu.readIo16Raw(0x012 + bg * 4) and 0x1FF
         val ty = (y + vofs) and (heightPx - 1)
         val tileY = ty ushr 3
         val fineY = ty and 7
+        val yBlockAdd = if (tileY >= 32) (if (widthPx == 512) 0x1000 else 0x800) else 0
+        val rowMapBase = screenBase + yBlockAdd + ((tileY and 31) shl 6)
+        val vram = mmu.vram
+        val vramSize = vram.size
+
+        var cachedTileX = -1
+        var hFlip = false
+        var palBank = 0
+        var tileRowAddr = 0
 
         for (x in 0 until GbaConstants.SCREEN_WIDTH) {
-            val tx = (x + hofs) and (widthPx - 1)
+            val tx = (x + hofs) and widthMask
             val tileX = tx ushr 3
             val fineX = tx and 7
 
-            var mapBlock = 0
-            if (tileX >= 32) mapBlock += 1
-            if (tileY >= 32) mapBlock += if (widthPx == 512) 2 else 1
-
-            val entryAddr = screenBase + mapBlock * 0x800 + ((tileY and 31) * 32 + (tileX and 31)) * 2
-            val entry = readVram16(entryAddr)
-            val tileId = entry and 0x3FF
-            val hFlip = (entry and 0x400) != 0
-            val vFlip = (entry and 0x800) != 0
-            val palBank = (entry ushr 12) and 0xF
+            if (tileX != cachedTileX) {
+                cachedTileX = tileX
+                val xBlockAdd = if (tileX >= 32) 0x800 else 0
+                val entryAddr = rowMapBase + xBlockAdd + ((tileX and 31) shl 1)
+                val entry = readVram16(entryAddr)
+                val tileId = entry and 0x3FF
+                hFlip = (entry and 0x400) != 0
+                val vFlip = (entry and 0x800) != 0
+                palBank = (entry ushr 12) and 0xF
+                val py = if (vFlip) 7 - fineY else fineY
+                tileRowAddr = if (color256) {
+                    charBase + (tileId shl 6) + (py shl 3)
+                } else {
+                    charBase + (tileId shl 5) + (py shl 2)
+                }
+            }
 
             val px = if (hFlip) 7 - fineX else fineX
-            val py = if (vFlip) 7 - fineY else fineY
-
             val colorIdx = if (color256) {
-                val addr = charBase + tileId * 64 + py * 8 + px
-                if (addr < mmu.vram.size) mmu.vram[addr].toInt() and 0xFF else 0
+                val addr = tileRowAddr + px
+                if (addr < vramSize) vram[addr].toInt() and 0xFF else 0
             } else {
-                val addr = charBase + tileId * 32 + py * 4 + (px ushr 1)
-                if (addr < mmu.vram.size) {
-                    val b = mmu.vram[addr].toInt() and 0xFF
+                val addr = tileRowAddr + (px ushr 1)
+                if (addr < vramSize) {
+                    val b = vram[addr].toInt() and 0xFF
                     if ((px and 1) == 0) b and 0x0F else (b ushr 4) and 0x0F
                 } else 0
             }
@@ -343,10 +366,5 @@ class GbaPpu(private val mmu: GbaMmu) {
         return (mmu.oam[o].toInt() and 0xFF) or ((mmu.oam[o + 1].toInt() and 0xFF) shl 8)
     }
 
-    private fun rgb555ToArgb(c: Int): Int {
-        val r = ((c and 0x1F) * 255) / 31
-        val g = (((c ushr 5) and 0x1F) * 255) / 31
-        val b = (((c ushr 10) and 0x1F) * 255) / 31
-        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-    }
+    private fun rgb555ToArgb(c: Int): Int = RGB555_LUT[c and 0x7FFF]
 }

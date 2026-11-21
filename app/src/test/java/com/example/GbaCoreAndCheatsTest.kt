@@ -598,5 +598,76 @@ class GbaCoreAndCheatsTest {
         assertTrue(emeraldMeta.hardwareFeatures.contains("RTC Clock"))
         assertFalse(emeraldMeta.hasRumbleSupport)
     }
+
+    @Test
+    fun apuGeneratesDirectSoundFifoAndPsgCh1ToCh4WaveformsWithSpeedupDecimation() {
+        val core = GbaCore()
+        core.loadRom(ByteArray(0x400), SaveType.SRAM, null)
+        core.apu.diagnosticCaptureEnabled = true
+        core.apu.enabled = true
+        core.apu.volume = 1.0f
+
+        // 1. Enable master sound (SOUNDCNT_X = 0x80)
+        core.mmu.write16(0x04000084, 0x0080)
+
+        // 2. Program EWRAM PCM buffer at 0x02004000 with alternating +/- 80 samples for DirectSound A
+        for (i in 0 until 128) {
+            val sample = if ((i and 2) == 0) 80 else -80
+            core.mmu.write8(0x02004000 + i, sample)
+        }
+
+        // Configure DMA1 -> FIFO_A (0x040000A0), special timing (3), repeat, 32-bit, word count = 4
+        core.mmu.write32(0x040000BC, 0x02004000) // DMA1SAD
+        core.mmu.write32(0x040000C0, 0x040000A0) // DMA1DAD (FIFO_A)
+        core.mmu.write16(0x040000C4, 4)          // DMA1CNT_L
+        core.mmu.write16(0x040000C6, 0xB640)     // Enable + FIFO timing(3) + 32-bit + repeat + fixed dst
+
+        // Configure Timer 0 at ~32 kHz (reload = 0xFE00 -> 512 cycles/sample)
+        core.mmu.write16(0x04000100, 0xFE00)
+        core.mmu.write16(0x04000102, 0x0080)
+
+        // Configure SOUNDCNT_L (all PSG Ch1..4 panned L+R, max vol) & SOUNDCNT_H (DSA 100% L+R on Timer 0 + PSG 100%)
+        core.mmu.write16(0x04000080, 0xFF77)
+        core.mmu.write16(0x04000082, 0x0B0E) // Reset FIFO A (bit 11 cleared after write), DSA Timer 0, L+R, 100%
+
+        // 3. Trigger PSG Ch1 (Square), Ch3 (Wave RAM dual-bank), Ch4 (Noise)
+        core.mmu.write16(0x04000062, 0xF080) // Ch1: vol=15, duty=50%
+        core.mmu.write16(0x04000064, 0x8600) // Ch1 trigger
+
+        // Write Wave RAM into inactive bank while bank 0 is selected, then flip to bank 1 for playback
+        core.mmu.write16(0x04000070, 0x0000) // Bank 0 selected -> CPU accesses bank 1
+        for (i in 0 until 16) {
+            core.mmu.write8(0x04000090 + i, if ((i and 1) == 0) 0xF0 else 0x0F)
+        }
+        assertEquals(0xF0, core.mmu.read8(0x04000090))
+        core.mmu.write16(0x04000070, 0x00C0) // Ch3 ON + Bank 1 active for playback
+        core.mmu.write16(0x04000072, 0x2000) // 100% volume
+        core.mmu.write16(0x04000074, 0x8400) // Ch3 trigger
+
+        core.mmu.write16(0x04000078, 0xE000) // Ch4 vol=14
+        core.mmu.write16(0x0400007C, 0x8021) // Ch4 trigger
+
+        // Verify SOUNDCNT_X reports Ch1 (0x01), Ch3 (0x04), Ch4 (0x08) active + master 0x80
+        val soundCntX = core.mmu.read8(0x04000084)
+        assertEquals(0x8D, soundCntX)
+
+        // Put CPU into HALT (like VBlankIntrWait) and step 1 frame at 1.0x -> timers/DMA/APU must still generate full stereo PCM!
+        core.mmu.halted = true
+        core.mmu.write16(0x04000004, 0x0008) // VBlank IRQ enable so VBlank wakes cleanly
+        core.mmu.write16(0x04000200, GbaConstants.IRQ_VBLANK)
+        core.mmu.write16(0x04000208, 1)
+
+        core.stepFrame(renderPixels = false, speedMultiplier = 1.0f)
+        val pcm1x = core.apu.readPcmSnapshot()
+        assertTrue("Expected ~1096 stereo shorts at 1x, got ${pcm1x.size}", pcm1x.size in 1050..1120)
+        assertTrue("Expected non-silent mixed PCM waveform", pcm1x.any { kotlin.math.abs(it.toInt()) > 500 })
+
+        // Verify 2.0x speedup decimates audio output smoothly (~half the samples per emulated frame)
+        core.stepFrame(renderPixels = false, speedMultiplier = 2.0f)
+        val pcm2x = core.apu.readPcmSnapshot()
+        assertTrue("Expected decimated ~548 shorts at 2x, got ${pcm2x.size}", pcm2x.size in 500..600)
+        assertTrue("Expected active audio signal at 2x turbo", pcm2x.any { kotlin.math.abs(it.toInt()) > 500 })
+    }
 }
+
 

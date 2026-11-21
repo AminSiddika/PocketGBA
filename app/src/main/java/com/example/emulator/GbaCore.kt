@@ -60,6 +60,7 @@ class GbaCore {
     fun stepFrame(renderPixels: Boolean, speedMultiplier: Float) {
         if (!isLoaded) return
         ppu.beginFrame()
+        apu.beginFrame(speedMultiplier, renderAudio = true)
 
         for (y in 0 until GbaConstants.TOTAL_SCANLINES) {
             // Update VCOUNT
@@ -100,7 +101,7 @@ class GbaCore {
             runCycles(272)
         }
 
-        apu.renderFrame(speedMultiplier)
+        apu.flushFrame(speedMultiplier)
     }
 
     private fun runCycles(targetCycles: Int) {
@@ -108,13 +109,17 @@ class GbaCore {
         while (elapsed < targetCycles) {
             if (mmu.halted) {
                 val rem = targetCycles - elapsed
-                mmu.stepTimers(rem)
-                cpu.totalCycles += rem
-                break
+                val chunk = if (rem > 512) 512 else rem
+                mmu.stepTimers(chunk)
+                apu.stepCycles(chunk)
+                cpu.totalCycles += chunk
+                elapsed += chunk
+            } else {
+                val c = cpu.step()
+                mmu.stepTimers(c)
+                apu.stepCycles(c)
+                elapsed += c
             }
-            val c = cpu.step()
-            mmu.stepTimers(c)
-            elapsed += c
         }
     }
 

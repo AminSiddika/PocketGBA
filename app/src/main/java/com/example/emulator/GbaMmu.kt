@@ -54,11 +54,19 @@ class GbaMmu {
     val dmaInternalDad = IntArray(4)
     val dmaInternalCount = IntArray(4)
 
-    // Audio FIFO & Rumble callbacks
+    // Audio FIFO, PSG & Rumble callbacks
     var onFifoWrite: ((channel: Int, word: Int) -> Unit)? = null
     var onTimerOverflow: ((timerIndex: Int) -> Unit)? = null
+    var onSoundRegisterWrite: ((offset: Int, value: Int) -> Unit)? = null
+    var onWaveRamWrite: ((offset: Int, byteVal: Int) -> Unit)? = null
+    var onWaveRamRead: ((offset: Int) -> Int)? = null
+    var onQuerySoundCntXBits: (() -> Int)? = null
     var onRumbleChanged: ((active: Boolean) -> Unit)? = null
     var hasExternalBios = false
+
+    // Fast-path CPU loop caches
+    @JvmField var irqPendingFast: Boolean = false
+    private var activeTimersMask: Int = 0
 
     // Cartridge GPIO (0x080000C4..C8) & Rumble motor state
     var gpioData = 0
@@ -137,6 +145,8 @@ class GbaMmu {
         // Default SOUNDBIAS = 0x0200, KEYINPUT = 0x03FF
         writeIo16Raw(0x088, 0x0200)
         writeIo16Raw(0x130, GbaConstants.KEY_ALL_RELEASED)
+        activeTimersMask = 0
+        irqPendingFast = false
     }
 
     private fun installHleBiosStubs() {
@@ -235,6 +245,66 @@ class GbaMmu {
                 v or (v shl 8)
             }
             else -> 0
+        }
+    }
+
+    fun fetch16(address: Int): Int {
+        val aligned = address and 0xFFFFFFFE.toInt()
+        val region = (aligned ushr 24) and 0xFF
+        return when (region) {
+            0x08, 0x09, 0x0A, 0x0B, 0x0C -> {
+                val o = aligned and 0x01FFFFFF
+                if (o + 1 < rom.size) {
+                    (rom[o].toInt() and 0xFF) or ((rom[o + 1].toInt() and 0xFF) shl 8)
+                } else (o ushr 1) and 0xFFFF
+            }
+            0x03 -> {
+                val o = aligned and 0x7FFF
+                (iwram[o].toInt() and 0xFF) or ((iwram[o + 1].toInt() and 0xFF) shl 8)
+            }
+            0x02 -> {
+                val o = aligned and 0x3FFFF
+                (ewram[o].toInt() and 0xFF) or ((ewram[o + 1].toInt() and 0xFF) shl 8)
+            }
+            else -> read16(aligned)
+        }
+    }
+
+    fun fetch32(address: Int): Int {
+        val aligned = address and 0xFFFFFFFC.toInt()
+        val region = (aligned ushr 24) and 0xFF
+        return when (region) {
+            0x08, 0x09, 0x0A, 0x0B, 0x0C -> {
+                val o = aligned and 0x01FFFFFF
+                if (o + 3 < rom.size) {
+                    (rom[o].toInt() and 0xFF) or
+                        ((rom[o + 1].toInt() and 0xFF) shl 8) or
+                        ((rom[o + 2].toInt() and 0xFF) shl 16) or
+                        ((rom[o + 3].toInt() and 0xFF) shl 24)
+                } else read32(aligned)
+            }
+            0x03 -> {
+                val o = aligned and 0x7FFF
+                (iwram[o].toInt() and 0xFF) or
+                    ((iwram[o + 1].toInt() and 0xFF) shl 8) or
+                    ((iwram[o + 2].toInt() and 0xFF) shl 16) or
+                    ((iwram[o + 3].toInt() and 0xFF) shl 24)
+            }
+            0x02 -> {
+                val o = aligned and 0x3FFFF
+                (ewram[o].toInt() and 0xFF) or
+                    ((ewram[o + 1].toInt() and 0xFF) shl 8) or
+                    ((ewram[o + 2].toInt() and 0xFF) shl 16) or
+                    ((ewram[o + 3].toInt() and 0xFF) shl 24)
+            }
+            0x00 -> if (aligned < 0x4000) {
+                val o = aligned and 0x3FFF
+                (bios[o].toInt() and 0xFF) or
+                    ((bios[o + 1].toInt() and 0xFF) shl 8) or
+                    ((bios[o + 2].toInt() and 0xFF) shl 16) or
+                    ((bios[o + 3].toInt() and 0xFF) shl 24)
+            } else 0
+            else -> read32(aligned)
         }
     }
 
@@ -459,9 +529,16 @@ class GbaMmu {
     }
 
     fun readIo8(offset: Int): Int {
-        if (offset == 0x130) return keyInput and 0xFF
-        if (offset == 0x131) return (keyInput ushr 8) and 0x03
-        return io[offset and 0x3FF].toInt() and 0xFF
+        val o = offset and 0x3FF
+        if (o == 0x130) return keyInput and 0xFF
+        if (o == 0x131) return (keyInput ushr 8) and 0x03
+        if (o in 0x090..0x09F) return onWaveRamRead?.invoke(o) ?: (io[o].toInt() and 0xFF)
+        if (o == 0x084) {
+            val master = io[0x084].toInt() and 0x80
+            val active = if (master != 0) (onQuerySoundCntXBits?.invoke() ?: 0) else 0
+            return master or active
+        }
+        return io[o].toInt() and 0xFF
     }
 
     fun readIo16(offset: Int): Int {
@@ -470,6 +547,16 @@ class GbaMmu {
         if (o in 0x100..0x10E && (o and 3) == 0) {
             val idx = (o - 0x100) ushr 2
             return timerCounter[idx] and 0xFFFF
+        }
+        if (o in 0x090..0x09E) {
+            val lo = onWaveRamRead?.invoke(o) ?: (io[o].toInt() and 0xFF)
+            val hi = onWaveRamRead?.invoke(o + 1) ?: (io[o + 1].toInt() and 0xFF)
+            return lo or (hi shl 8)
+        }
+        if (o == 0x084) {
+            val master = io[0x084].toInt() and 0x80
+            val active = if (master != 0) (onQuerySoundCntXBits?.invoke() ?: 0) else 0
+            return master or active
         }
         return (io[o].toInt() and 0xFF) or ((io[o + 1].toInt() and 0xFF) shl 8)
     }
@@ -483,6 +570,28 @@ class GbaMmu {
         val o = offset and 0x3FE
         io[o] = (value and 0xFF).toByte()
         io[o + 1] = ((value ushr 8) and 0xFF).toByte()
+        if (o == 0x200 || o == 0x202 || o == 0x208) {
+            refreshIrqPending()
+        }
+    }
+
+    private fun refreshIrqPending() {
+        val ime = ((io[0x208].toInt() and 0xFF) or ((io[0x209].toInt() and 0xFF) shl 8)) and 1
+        if (ime == 0) {
+            irqPendingFast = false
+            return
+        }
+        val ie = (io[0x200].toInt() and 0xFF) or ((io[0x201].toInt() and 0xFF) shl 8)
+        val irqFlags = (io[0x202].toInt() and 0xFF) or ((io[0x203].toInt() and 0xFF) shl 8)
+        irqPendingFast = (ie and irqFlags) != 0
+    }
+
+    private fun updateActiveTimersMask() {
+        var mask = 0
+        for (i in 0..3) {
+            if ((timerControl[i] and 0x80) != 0) mask = mask or (1 shl i)
+        }
+        activeTimersMask = mask
     }
 
     private fun writeIo8(offset: Int, value: Int) {
@@ -494,6 +603,11 @@ class GbaMmu {
                 return
             }
             0x006, 0x007 -> return
+            in 0x090..0x09F -> {
+                io[o] = value.toByte()
+                onWaveRamWrite?.invoke(o, value and 0xFF)
+                return
+            }
             0x100, 0x101, 0x104, 0x105, 0x108, 0x109, 0x10C, 0x10D -> {
                 val base = o and 0x3FE
                 val idx = (base - 0x100) ushr 2
@@ -513,6 +627,7 @@ class GbaMmu {
                     timerCounter[idx] = timerReload[idx]
                     timerSubCycles[idx] = 0
                 }
+                updateActiveTimersMask()
                 return
             }
             0x132, 0x133 -> {
@@ -524,6 +639,12 @@ class GbaMmu {
                 // IF is write-1-to-clear
                 val cur = io[o].toInt() and 0xFF
                 io[o] = (cur and value.inv()).toByte()
+                refreshIrqPending()
+                return
+            }
+            0x200, 0x201, 0x208, 0x209 -> {
+                io[o] = value.toByte()
+                refreshIrqPending()
                 return
             }
             0x301 -> {
@@ -549,6 +670,12 @@ class GbaMmu {
                 return
             }
             0x006 -> return // VCOUNT is read-only
+            in 0x090..0x09E -> {
+                writeIo16Raw(o, value)
+                onWaveRamWrite?.invoke(o, value and 0xFF)
+                onWaveRamWrite?.invoke(o + 1, (value ushr 8) and 0xFF)
+                return
+            }
             0x132 -> {
                 writeIo16Raw(0x132, value and 0xC3FF)
                 checkKeypadIrq()
@@ -581,6 +708,7 @@ class GbaMmu {
                     timerCounter[idx] = timerReload[idx]
                     timerSubCycles[idx] = 0
                 }
+                updateActiveTimersMask()
                 writeIo16Raw(o, value)
                 return
             }
@@ -592,6 +720,9 @@ class GbaMmu {
 
     private fun handleIoHalfwordSideEffects(o: Int, value: Int) {
         when (o) {
+            // Sound control & PSG registers
+            in 0x060..0x088 -> onSoundRegisterWrite?.invoke(o, value)
+
             // BG2/BG3 reference points
             0x028, 0x02A -> bg2RefX = signExtend28(readIo32Raw(0x028))
             0x02C, 0x02E -> bg2RefY = signExtend28(readIo32Raw(0x02C))
@@ -752,6 +883,7 @@ class GbaMmu {
     }
 
     fun stepTimers(cycles: Int) {
+        if (activeTimersMask == 0) return
         var prevOverflow = false
         for (i in 0..3) {
             val ctrl = timerControl[i]
@@ -760,28 +892,30 @@ class GbaMmu {
                 continue
             }
             val cascade = i > 0 && (ctrl and 0x04) != 0
-            var increments = 0
+            val increments: Int
             if (cascade) {
-                if (prevOverflow) increments = 1
+                increments = if (prevOverflow) 1 else 0
             } else {
-                val prescaler = when (ctrl and 3) {
-                    0 -> 1
-                    1 -> 64
-                    2 -> 256
-                    else -> 1024
+                val shift = when (ctrl and 3) {
+                    0 -> 0
+                    1 -> 6
+                    2 -> 8
+                    else -> 10
                 }
-                timerSubCycles[i] += cycles
-                while (timerSubCycles[i] >= prescaler) {
-                    timerSubCycles[i] -= prescaler
-                    increments++
+                if (shift == 0) {
+                    increments = cycles
+                } else {
+                    val total = timerSubCycles[i] + cycles
+                    increments = total ushr shift
+                    timerSubCycles[i] = total and ((1 shl shift) - 1)
                 }
             }
             prevOverflow = false
             if (increments > 0) {
                 var cnt = timerCounter[i] + increments
+                val period = (0x10000 - timerReload[i]).coerceAtLeast(1)
                 while (cnt >= 0x10000) {
-                    cnt -= (0x10000 - timerReload[i])
-                    if (cnt < timerReload[i]) cnt = timerReload[i]
+                    cnt -= period
                     prevOverflow = true
                     if ((ctrl and 0x40) != 0) {
                         raiseIrq(GbaConstants.IRQ_TIMER0 shl i)
@@ -805,13 +939,7 @@ class GbaMmu {
         }
     }
 
-    fun hasPendingIrq(): Boolean {
-        val ime = readIo16Raw(0x208) and 1
-        if (ime == 0) return false
-        val ie = readIo16Raw(0x200)
-        val irqFlags = readIo16Raw(0x202)
-        return (ie and irqFlags) != 0
-    }
+    fun hasPendingIrq(): Boolean = irqPendingFast
 
     fun checkKeypadIrq() {
         val keycnt = readIo16Raw(0x132)
@@ -1051,6 +1179,8 @@ class GbaMmu {
             gpioControl = 0
             updateRumbleState(false)
         }
+        updateActiveTimersMask()
+        refreshIrqPending()
         sramDirty = true
     }
 }

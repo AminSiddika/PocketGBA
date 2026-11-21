@@ -87,6 +87,33 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     private val _frameBitmap = MutableStateFlow<Bitmap?>(null)
     val frameBitmap: StateFlow<Bitmap?> = _frameBitmap.asStateFlow()
 
+    private val frameBitmapA = Bitmap.createBitmap(
+        GbaConstants.SCREEN_WIDTH,
+        GbaConstants.SCREEN_HEIGHT,
+        Bitmap.Config.ARGB_8888
+    )
+    private val frameBitmapB = Bitmap.createBitmap(
+        GbaConstants.SCREEN_WIDTH,
+        GbaConstants.SCREEN_HEIGHT,
+        Bitmap.Config.ARGB_8888
+    )
+    private var useBitmapA = true
+
+    private fun publishFrameBuffer() {
+        val target = if (useBitmapA) frameBitmapA else frameBitmapB
+        useBitmapA = !useBitmapA
+        target.setPixels(
+            core.ppu.frameBuffer,
+            0,
+            GbaConstants.SCREEN_WIDTH,
+            0,
+            0,
+            GbaConstants.SCREEN_WIDTH,
+            GbaConstants.SCREEN_HEIGHT
+        )
+        _frameBitmap.value = target
+    }
+
     private var compiledCheats: List<CompiledCheat> = emptyList()
     private var emuJob: Job? = null
     private var cheatsObserveJob: Job? = null
@@ -238,13 +265,9 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                 romRepo.markPlayed(rom.id)
 
                 val slots = saveRepo.inspectAllSlots(rom.baseName, rom.crc32Hex)
-                val bmp = Bitmap.createBitmap(
-                    core.ppu.frameBuffer,
-                    GbaConstants.SCREEN_WIDTH,
-                    GbaConstants.SCREEN_HEIGHT,
-                    Bitmap.Config.ARGB_8888
-                )
-                _frameBitmap.value = bmp
+                synchronized(lock) {
+                    publishFrameBuffer()
+                }
 
                 _uiState.update { state ->
                     val resolvedProfile = resolveShaderProfile(rom, state.preferences, state.shaderProfiles)
@@ -294,48 +317,38 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
             var frameCounter = 0
             var lastFpsAt = System.currentTimeMillis()
             var lastPlayFlushAt = lastFpsAt
+            var frameAccumulator = 0f
+            var nextDeadlineNs = System.nanoTime()
+            val framePeriodNs = 16_742_706L // GBA 59.7275 Hz native cadence
 
             while (isActive) {
                 val state = _uiState.value
                 if (state.isPaused || !core.isLoaded) {
+                    nextDeadlineNs = System.nanoTime()
+                    frameAccumulator = 0f
                     delay(16L)
                     continue
                 }
 
                 val targetSpeed = state.currentSpeedMultiplier.coerceIn(1f, 8f)
-                val steps = when {
-                    targetSpeed >= 7.5f -> 8
-                    targetSpeed >= 5.5f -> 6
-                    targetSpeed >= 3.5f -> 4
-                    targetSpeed >= 2.5f -> 3
-                    targetSpeed >= 1.75f -> 2
-                    else -> 1
-                }
+                frameAccumulator = (frameAccumulator + targetSpeed).coerceAtMost(8f)
+                val steps = frameAccumulator.toInt().coerceIn(1, 8)
+                frameAccumulator -= steps
 
-                val frameStartNs = System.nanoTime()
+                val batchStartNs = System.nanoTime()
+                var executedSteps = 0
                 synchronized(lock) {
-                    if (steps == 1 && targetSpeed > 1.2f) {
-                        core.stepFrame(renderPixels = true, speedMultiplier = targetSpeed)
-                        if ((frameCounter and 1) == 0) {
-                            core.stepFrame(renderPixels = false, speedMultiplier = targetSpeed)
-                        }
-                    } else {
-                        for (s in 0 until steps) {
-                            val render = (s == steps - 1)
-                            core.stepFrame(renderPixels = render, speedMultiplier = targetSpeed)
-                        }
+                    for (s in 0 until steps) {
+                        val isFinal = (s == steps - 1) ||
+                            (s > 0 && (System.nanoTime() - batchStartNs) > 18_000_000L)
+                        core.stepFrame(renderPixels = isFinal, speedMultiplier = targetSpeed)
+                        executedSteps++
+                        if (isFinal) break
                     }
+                    publishFrameBuffer()
                 }
 
-                val bmp = Bitmap.createBitmap(
-                    core.ppu.frameBuffer,
-                    GbaConstants.SCREEN_WIDTH,
-                    GbaConstants.SCREEN_HEIGHT,
-                    Bitmap.Config.ARGB_8888
-                )
-                _frameBitmap.value = bmp
-
-                frameCounter += steps
+                frameCounter += executedSteps
                 val now = System.currentTimeMillis()
                 if (now - lastFpsAt >= 500L) {
                     val elapsedSec = (now - lastFpsAt) / 1000.0
@@ -366,10 +379,14 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                     }
                 }
 
-                val targetFrameNs = if (steps == 1 && targetSpeed > 1.2f) 11_111_000L else 16_666_000L
-                val elapsedNs = System.nanoTime() - frameStartNs
-                val sleepMs = (targetFrameNs - elapsedNs) / 1_000_000L
-                if (sleepMs > 1L) delay(sleepMs)
+                nextDeadlineNs += framePeriodNs
+                val afterWorkNs = System.nanoTime()
+                val remainingNs = nextDeadlineNs - afterWorkNs
+                if (remainingNs > 1_500_000L) {
+                    delay(remainingNs / 1_000_000L)
+                } else if (remainingNs < -framePeriodNs * 3L) {
+                    nextDeadlineNs = afterWorkNs
+                }
             }
         }
     }
@@ -384,6 +401,7 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun setPaused(paused: Boolean) {
+        core.apu.setPlaybackPaused(paused)
         if (paused) {
             rumbleEngine.stop()
         } else {
@@ -495,6 +513,8 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
             val rom = _uiState.value.rom ?: return@launch
             rumbleEngine.stop()
             synchronized(lock) {
+                core.apu.reset()
+                core.apu.flushTrack()
                 core.cpu.resetToRomEntry(_uiState.value.preferences.skipBiosIntro)
             }
             _uiState.update {
@@ -549,13 +569,11 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                 }
             }
             result.onSuccess { info ->
-                val bmp = Bitmap.createBitmap(
-                    core.ppu.frameBuffer,
-                    GbaConstants.SCREEN_WIDTH,
-                    GbaConstants.SCREEN_HEIGHT,
-                    Bitmap.Config.ARGB_8888
-                )
-                _frameBitmap.value = bmp
+                synchronized(lock) {
+                    core.apu.flushTrack()
+                    core.apu.setPlaybackPaused(false)
+                    publishFrameBuffer()
+                }
                 _uiState.update {
                     it.copy(
                         isPaused = false,
@@ -950,6 +968,7 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
 
     fun flushAndPause() {
         rumbleEngine.stop()
+        core.apu.setPlaybackPaused(true)
         val state = _uiState.value
         val rom = state.rom ?: return
         val meta = state.metadata
@@ -973,11 +992,11 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                 }
                 saveRepo.saveBatterySram(rom.baseName, copy)
             }
-            if (shouldAutoSave) {
+            if (shouldAutoSave && meta != null) {
                 val totalPlay = rom.totalPlaySeconds + sessionPlaySeconds
                 val saveRes = synchronized(lock) {
                     kotlinx.coroutines.runBlocking {
-                        saveRepo.saveToSlot(rom.baseName, 0, meta!!, totalPlay, core)
+                        saveRepo.saveToSlot(rom.baseName, 0, meta, totalPlay, core)
                     }
                 }
                 saveRes.onSuccess {
