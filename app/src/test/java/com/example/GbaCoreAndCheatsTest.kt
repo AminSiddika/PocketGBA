@@ -1,5 +1,8 @@
 package com.example
 
+import com.example.data.GbaMetadataScraper
+import com.example.data.db.RomEntity
+import com.example.emulator.GbaBiosManager
 import com.example.emulator.GbaConstants
 import com.example.emulator.GbaCore
 import com.example.emulator.GbaRomHeaderParser
@@ -11,8 +14,13 @@ import com.example.emulator.cheats.ChtFileParser
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class GbaCoreAndCheatsTest {
 
@@ -105,4 +113,119 @@ class GbaCoreAndCheatsTest {
             CheatDecoder.normalizeCodeKey("82001000:03E7\n")
         )
     }
+
+    @Test
+    fun gpioAndGameBoyPlayerRumbleTriggersAndRestoresSnapshot() {
+        val core = GbaCore()
+        core.loadRom(HomebrewRomBuilder.buildPixelQuestRom(), SaveType.SRAM, null)
+
+        val rumbleTransitions = mutableListOf<Boolean>()
+        core.mmu.onRumbleChanged = { rumbleTransitions.add(it) }
+
+        // Enable Cartridge GPIO output direction & control, then activate rumble bit 3
+        core.mmu.write16(0x080000C8, 0x0001)
+        core.mmu.write16(0x080000C6, 0x0008)
+        core.mmu.write16(0x080000C4, 0x0008)
+
+        assertTrue(core.mmu.rumbleActive)
+        assertTrue(core.getTelemetry().rumbleActive)
+        assertEquals(1L, core.getTelemetry().rumbleEventsCount)
+        assertEquals(listOf(true), rumbleTransitions)
+
+        // Snapshot while active, turn off, then restore
+        val snap = core.captureCompressedState()
+        core.mmu.write16(0x080000C4, 0x0000)
+        assertFalse(core.mmu.rumbleActive)
+
+        assertTrue(core.restoreCompressedState(snap))
+        assertTrue(core.mmu.rumbleActive)
+
+        // Game Boy Player Serial rumble off/on packet (0x40000010 / 0x40000011)
+        core.mmu.write32(0x04000120, 0x40000010)
+        core.mmu.write16(0x04000128, 0x4080) // Start transfer + IRQ
+        assertFalse(core.mmu.rumbleActive)
+        assertTrue((core.mmu.readIo16Raw(0x202) and GbaConstants.IRQ_SERIAL) != 0)
+
+        core.mmu.write32(0x04000120, 0x40000011)
+        core.mmu.write16(0x04000128, 0x0080)
+        assertTrue(core.mmu.rumbleActive)
+    }
+
+    @Test
+    fun biosManagerValidatesVectorCrcAndZipExtraction() {
+        val invalidSmall = ByteArray(1024)
+        assertFalse(GbaBiosManager.isValidGbaBiosBytes(invalidSmall))
+        assertNull(GbaBiosManager.inspectBytes(invalidSmall))
+
+        val invalidOp = ByteArray(GbaBiosManager.BIOS_SIZE)
+        assertFalse(GbaBiosManager.isValidGbaBiosBytes(invalidOp))
+
+        val validBios = ByteArray(GbaBiosManager.BIOS_SIZE)
+        // ARM unconditional branch 0xEA000018 (little endian)
+        validBios[0] = 0x18
+        validBios[1] = 0x00
+        validBios[2] = 0x00
+        validBios[3] = 0xEA.toByte()
+
+        val status = GbaBiosManager.inspectBytes(validBios, "custom_bios.bin")
+        assertNotNull(status)
+        assertTrue(status!!.hasCustomBios)
+        assertFalse(status.isOfficialNintendo)
+        assertEquals(8, status.crc32Hex?.length)
+
+        // Pack into a ZIP and verify extraction
+        val zipBytes = ByteArrayOutputStream().use { baos ->
+            ZipOutputStream(baos).use { zos ->
+                zos.putNextEntry(ZipEntry("readme.txt"))
+                zos.write("not a bios".toByteArray())
+                zos.closeEntry()
+
+                zos.putNextEntry(ZipEntry("bios/gba_bios.bin"))
+                zos.write(validBios)
+                zos.closeEntry()
+            }
+            baos.toByteArray()
+        }
+
+        val extracted = GbaBiosManager.extractBiosBytes(zipBytes, "bios_pack.zip")
+        assertNotNull(extracted)
+        assertEquals("gba_bios.bin", extracted!!.second)
+        assertEquals(GbaBiosManager.BIOS_SIZE, extracted.first.size)
+    }
+
+    @Test
+    fun metadataScraperExtractsPublisherRegionAndSensorsLocally() {
+        val drillDozer = RomEntity(
+            title = "DRILL DOZER",
+            gameCode = "V49E",
+            makerCode = "01",
+            crc32Hex = "12345678",
+            baseName = "drill_dozer",
+            filePath = "/tmp/drill.gba",
+            sizeBytes = 8 * 1024 * 1024L,
+            saveType = "SRAM"
+        )
+        val drillMeta = GbaMetadataScraper.extractLocalMetadata(drillDozer, null)
+        assertEquals("Drill Dozer", drillMeta.displayTitle)
+        assertEquals("Nintendo", drillMeta.publisher)
+        assertEquals("USA", drillMeta.region)
+        assertTrue(drillMeta.hasRumbleSupport)
+        assertTrue(drillMeta.hardwareFeatures.contains("Rumble"))
+
+        val emerald = RomEntity(
+            title = "POKEMON EMER",
+            gameCode = "BPEP",
+            makerCode = "01",
+            crc32Hex = "87654321",
+            baseName = "emerald",
+            filePath = "/tmp/emerald.gba",
+            sizeBytes = 16 * 1024 * 1024L,
+            saveType = "FLASH128"
+        )
+        val emeraldMeta = GbaMetadataScraper.extractLocalMetadata(emerald, "SIIRTC_V001".toByteArray())
+        assertEquals("Europe", emeraldMeta.region)
+        assertTrue(emeraldMeta.hardwareFeatures.contains("RTC Clock"))
+        assertFalse(emeraldMeta.hasRumbleSupport)
+    }
 }
+

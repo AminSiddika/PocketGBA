@@ -12,6 +12,8 @@ import com.example.data.db.CheatEntity
 import com.example.data.db.RomEntity
 import com.example.data.db.ShaderProfileEntity
 import com.example.data.savestate.SaveStateRepository
+import com.example.emulator.BiosMode
+import com.example.emulator.BiosStatusInfo
 import com.example.emulator.cheats.CheatFormat
 import com.example.emulator.cheats.ChtFileParser
 import com.example.emulator.cheats.ZipCheatCandidate
@@ -20,6 +22,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
@@ -39,13 +42,17 @@ data class LibraryUiState(
     val roms: List<RomLibraryCard> = emptyList(),
     val searchQuery: String = "",
     val isImporting: Boolean = false,
+    val isScrapingMetadata: Boolean = false,
     val statusMessage: String? = null,
     val shaderProfiles: List<ShaderProfileEntity> = emptyList(),
     val activeShaderProfileId: Long = 0L,
     val masterCheatsEnabled: Boolean = true,
     val managingCheatsForRom: RomEntity? = null,
     val managedRomCheats: List<CheatEntity> = emptyList(),
-    val zipCandidates: List<ZipCheatCandidate> = emptyList()
+    val zipCandidates: List<ZipCheatCandidate> = emptyList(),
+    val inspectingRom: RomEntity? = null,
+    val biosStatus: BiosStatusInfo = BiosStatusInfo(),
+    val biosMode: BiosMode = BiosMode.AUTO
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -57,10 +64,13 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     private val searchQuery = MutableStateFlow("")
     private val isImporting = MutableStateFlow(false)
+    private val isScrapingMetadata = MutableStateFlow(false)
     private val statusMessage = MutableStateFlow<String?>(null)
     private val slotRefreshTick = MutableStateFlow(0)
     private val managingCheatsRom = MutableStateFlow<RomEntity?>(null)
     private val zipCandidates = MutableStateFlow<List<ZipCheatCandidate>>(emptyList())
+    private val inspectingRom = MutableStateFlow<RomEntity?>(null)
+    private val biosStatusFlow = MutableStateFlow(BiosStatusInfo())
 
     init {
         viewModelScope.launch {
@@ -68,12 +78,15 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             // Default active profile to LCD3x Grid if unset
             if (profiles.isNotEmpty()) {
                 val lcd3x = profiles.firstOrNull { it.baseMode == "LCD3X" } ?: profiles.first()
-                prefsRepo.preferences.collect { prefs ->
-                    if (prefs.activeShaderProfileId == 0L) {
-                        prefsRepo.setActiveShaderProfileId(lcd3x.id)
-                    }
-                    return@collect
+                val prefs = prefsRepo.preferences.first()
+                if (prefs.activeShaderProfileId == 0L) {
+                    prefsRepo.setActiveShaderProfileId(lcd3x.id)
                 }
+            }
+        }
+        viewModelScope.launch {
+            prefsRepo.preferences.collect { prefs ->
+                biosStatusFlow.value = romRepo.resolveBios(prefs.biosMode, prefs.customBiosPath)
             }
         }
     }
@@ -87,13 +100,16 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         romRepo.observeAllRomCheatStats(),
         searchQuery,
         isImporting,
+        isScrapingMetadata,
         statusMessage,
         slotRefreshTick,
         romRepo.observeShaderProfiles(),
         prefsRepo.preferences,
         managingCheatsRom,
         managedRomCheatsFlow,
-        zipCandidates
+        zipCandidates,
+        inspectingRom,
+        biosStatusFlow
     ) { values ->
         @Suppress("UNCHECKED_CAST")
         val roms = values[0] as List<RomEntity>
@@ -101,21 +117,26 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         val cheatStats = values[1] as List<com.example.data.db.RomCheatStats>
         val query = values[2] as String
         val importing = values[3] as Boolean
-        val status = values[4] as String?
+        val scraping = values[4] as Boolean
+        val status = values[5] as String?
         @Suppress("UNCHECKED_CAST")
-        val shaderProfiles = values[6] as List<ShaderProfileEntity>
-        val prefs = values[7] as com.example.data.EmulatorPreferences
-        val cheatRom = values[8] as RomEntity?
+        val shaderProfiles = values[7] as List<ShaderProfileEntity>
+        val prefs = values[8] as com.example.data.EmulatorPreferences
+        val cheatRom = values[9] as RomEntity?
         @Suppress("UNCHECKED_CAST")
-        val managedCheats = values[9] as List<CheatEntity>
+        val managedCheats = values[10] as List<CheatEntity>
         @Suppress("UNCHECKED_CAST")
-        val zips = values[10] as List<ZipCheatCandidate>
+        val zips = values[11] as List<ZipCheatCandidate>
+        val inspecting = values[12] as RomEntity?
+        val biosInfo = values[13] as BiosStatusInfo
 
         val statsMap = cheatStats.associateBy { it.romId }
         val filtered = if (query.isBlank()) roms else {
             val q = query.trim().lowercase()
             roms.filter {
                 it.title.lowercase().contains(q) ||
+                    (it.displayTitle?.lowercase()?.contains(q) == true) ||
+                    it.publisher.lowercase().contains(q) ||
                     it.gameCode.lowercase().contains(q) ||
                     it.crc32Hex.lowercase().contains(q)
             }
@@ -136,17 +157,24 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                 enabledCheats = st?.enabledCount ?: 0
             )
         }
+        val syncedInspecting = inspecting?.let { cur ->
+            roms.firstOrNull { it.id == cur.id } ?: cur
+        }
         LibraryUiState(
             roms = cards,
             searchQuery = query,
             isImporting = importing,
+            isScrapingMetadata = scraping,
             statusMessage = status,
             shaderProfiles = shaderProfiles,
             activeShaderProfileId = prefs.activeShaderProfileId,
             masterCheatsEnabled = prefs.masterCheatsEnabled,
             managingCheatsForRom = cheatRom,
             managedRomCheats = managedCheats,
-            zipCandidates = zips
+            zipCandidates = zips,
+            inspectingRom = syncedInspecting,
+            biosStatus = biosInfo,
+            biosMode = prefs.biosMode
         )
     }.stateIn(
         scope = viewModelScope,
@@ -343,4 +371,111 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                 .onFailure { err -> statusMessage.value = err.message ?: "Export failed." }
         }
     }
+
+    // === GBA Metadata & Box Art Scraper ===
+
+    fun openRomInfo(rom: RomEntity) {
+        inspectingRom.value = rom
+    }
+
+    fun closeRomInfo() {
+        inspectingRom.value = null
+    }
+
+    fun scrapeSingleRom(rom: RomEntity) {
+        viewModelScope.launch {
+            isScrapingMetadata.value = true
+            romRepo.scrapeRomMetadata(rom)
+                .onSuccess { updated ->
+                    inspectingRom.value = updated
+                    val coverMsg = if (updated.coverArtPath != null) " + box art" else ""
+                    statusMessage.value = "Scraped ${updated.displayTitle ?: updated.title}$coverMsg"
+                }
+                .onFailure { err ->
+                    statusMessage.value = err.message ?: "Metadata scrape failed."
+                }
+            isScrapingMetadata.value = false
+        }
+    }
+
+    fun scrapeAllMetadata() {
+        viewModelScope.launch {
+            isScrapingMetadata.value = true
+            romRepo.scrapeAllRomsMetadata()
+                .onSuccess { (total, matched) ->
+                    statusMessage.value = if (total == 0) {
+                        "Import a ROM first to scrape GBA metadata."
+                    } else {
+                        "Updated metadata for $total ROMs ($matched remote DAT/cover matches)"
+                    }
+                }
+                .onFailure { err ->
+                    statusMessage.value = err.message ?: "Metadata scrape failed."
+                }
+            isScrapingMetadata.value = false
+        }
+    }
+
+    // === GBA BIOS Auto ===
+
+    fun setBiosMode(mode: BiosMode) {
+        viewModelScope.launch {
+            prefsRepo.setBiosMode(mode)
+            val prefs = prefsRepo.preferences.first()
+            val resolved = romRepo.resolveBios(mode, prefs.customBiosPath)
+            biosStatusFlow.value = resolved
+            statusMessage.value = "BIOS: ${resolved.sourceLabel}"
+        }
+    }
+
+    fun importBios(uri: Uri) {
+        viewModelScope.launch {
+            romRepo.importBiosStatusFromUri(uri)
+                .onSuccess { info ->
+                    prefsRepo.setCustomBiosPath(info.storedFilePath)
+                    prefsRepo.setBiosMode(BiosMode.CUSTOM)
+                    biosStatusFlow.value = info
+                    statusMessage.value = "Loaded ${info.sourceLabel}"
+                }
+                .onFailure { err ->
+                    statusMessage.value = err.message ?: "BIOS import failed."
+                }
+        }
+    }
+
+    fun scanBiosFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            romRepo.scanFolderForBios(treeUri)
+                .onSuccess { info ->
+                    prefsRepo.setCustomBiosPath(info.storedFilePath)
+                    prefsRepo.setBiosMode(BiosMode.AUTO)
+                    biosStatusFlow.value = info
+                    statusMessage.value = "Auto-detected ${info.sourceLabel}"
+                }
+                .onFailure { err ->
+                    statusMessage.value = err.message ?: "No valid 16KB GBA BIOS found in folder."
+                }
+        }
+    }
+
+    fun autoDetectBios() {
+        viewModelScope.launch {
+            val prefs = prefsRepo.preferences.first()
+            prefsRepo.setBiosMode(BiosMode.AUTO)
+            val info = romRepo.resolveBios(BiosMode.AUTO, prefs.customBiosPath)
+            biosStatusFlow.value = info
+            statusMessage.value = info.sourceLabel
+        }
+    }
+
+    fun clearCustomBios() {
+        viewModelScope.launch {
+            prefsRepo.setCustomBiosPath(null)
+            prefsRepo.setBiosMode(BiosMode.AUTO)
+            val resolved = romRepo.resolveBios(BiosMode.AUTO, null)
+            biosStatusFlow.value = resolved
+            statusMessage.value = "Custom BIOS path cleared (${resolved.sourceLabel})"
+        }
+    }
 }
+

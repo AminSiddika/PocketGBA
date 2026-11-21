@@ -21,7 +21,16 @@ data class RomEntity(
     val lastPlayedAt: Long = 0L,
     val addedAt: Long = System.currentTimeMillis(),
     val preferredShaderProfileId: Long? = null,
-    val preferredSpeedMultiplier: Float? = null
+    val preferredSpeedMultiplier: Float? = null,
+    val displayTitle: String? = null,
+    val publisher: String = "",
+    val region: String = "",
+    val releaseYear: String = "",
+    val genre: String = "",
+    val hardwareFeatures: String = "",
+    val hasRumbleSupport: Boolean = false,
+    val coverArtPath: String? = null,
+    val metadataScrapedAt: Long = 0L
 )
 
 @Entity(tableName = "cheats")

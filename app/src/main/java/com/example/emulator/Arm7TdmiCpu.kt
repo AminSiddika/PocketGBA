@@ -42,7 +42,7 @@ class Arm7TdmiCpu(
     var totalCycles: Long = 0L
     private var shifterCarry = false
 
-    fun resetToRomEntry() {
+    fun resetToRomEntry(skipBiosIntro: Boolean = true) {
         r.fill(0)
         usrBank8_14.fill(0)
         fiqBank8_14.fill(0)
@@ -57,7 +57,7 @@ class Arm7TdmiCpu(
         svcBank13_14[0] = 0x03007FE0
         cpsr = MODE_SYS
         r[13] = 0x03007F00
-        r[15] = if (mmu.hasExternalBios) 0x00000000 else 0x08000000
+        r[15] = if (mmu.hasExternalBios && !skipBiosIntro) 0x00000000 else 0x08000000
         totalCycles = 0L
     }
 

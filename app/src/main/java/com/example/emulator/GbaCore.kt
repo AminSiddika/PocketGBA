@@ -13,7 +13,9 @@ data class CoreTelemetry(
     val cpuMode: String,
     val videoMode: Int,
     val totalCycles: Long,
-    val saveType: SaveType
+    val saveType: SaveType,
+    val rumbleActive: Boolean = false,
+    val rumbleEventsCount: Long = 0L
 )
 
 class GbaCore {
@@ -29,7 +31,13 @@ class GbaCore {
 
     var onVBlankCheatHook: ((GbaMmu) -> Unit)? = null
 
-    fun loadRom(romBytes: ByteArray, saveType: SaveType, initialSram: ByteArray?, customBios: ByteArray? = null) {
+    fun loadRom(
+        romBytes: ByteArray,
+        saveType: SaveType,
+        initialSram: ByteArray?,
+        customBios: ByteArray? = null,
+        skipBiosIntro: Boolean = true
+    ) {
         mmu.reset(romBytes, saveType, customBios)
         if (initialSram != null) {
             val copyLen = minOf(initialSram.size, mmu.sram.size)
@@ -40,7 +48,7 @@ class GbaCore {
             mmu.sramDirty = false
         }
         apu.reset()
-        cpu.resetToRomEntry()
+        cpu.resetToRomEntry(skipBiosIntro)
         isLoaded = true
     }
 
@@ -115,7 +123,9 @@ class GbaCore {
         cpuMode = cpu.currentModeName(),
         videoMode = ppu.currentVideoMode(),
         totalCycles = cpu.totalCycles,
-        saveType = mmu.saveType
+        saveType = mmu.saveType,
+        rumbleActive = mmu.rumbleActive,
+        rumbleEventsCount = mmu.rumbleEventsCount
     )
 
     fun captureCompressedState(): ByteArray {

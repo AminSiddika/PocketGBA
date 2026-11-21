@@ -209,6 +209,12 @@ fun PlayerScreen(
         if (uri != null) viewModel.importBios(uri)
     }
 
+    val scanBiosFolderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) viewModel.scanBiosFolder(uri)
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -462,6 +468,7 @@ fun PlayerScreen(
         ShaderAndSettingsSheet(
             preferences = state.preferences,
             activeShaderProfile = state.activeShaderProfile,
+            biosStatus = state.biosStatus,
             currentRom = state.rom,
             onDismiss = { showSettingsSheet = false },
             onOpenShadersManager = {
@@ -477,9 +484,16 @@ fun PlayerScreen(
             onSelectOrientation = viewModel::setOrientationMode,
             onAudioToggle = viewModel::setAudioEnabled,
             onHapticsToggle = viewModel::setHapticsEnabled,
+            onRumbleToggle = viewModel::setRumbleEnabled,
+            onRumbleIntensityChange = viewModel::setRumbleIntensity,
+            onTestRumble = viewModel::testRumble,
             onOpacityChange = viewModel::setControlOpacity,
             onScaleChange = viewModel::setControlScale,
-            onImportBios = { importBiosLauncher.launch(arrayOf("application/octet-stream", "*/*")) },
+            onSelectBiosMode = viewModel::setBiosMode,
+            onSkipBiosIntroToggle = viewModel::setSkipBiosIntro,
+            onAutoDetectBios = viewModel::autoDetectBios,
+            onScanBiosFolder = { scanBiosFolderLauncher.launch(null) },
+            onImportBios = { importBiosLauncher.launch(arrayOf("application/octet-stream", "application/zip", "*/*")) },
             onClearBios = viewModel::clearCustomBios
         )
     }

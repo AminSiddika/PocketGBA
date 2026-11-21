@@ -8,6 +8,9 @@ import com.example.data.db.EmulatorDao
 import com.example.data.db.RomCheatStats
 import com.example.data.db.RomEntity
 import com.example.data.db.ShaderProfileEntity
+import com.example.emulator.BiosMode
+import com.example.emulator.BiosStatusInfo
+import com.example.emulator.GbaBiosManager
 import com.example.emulator.GbaRomHeaderParser
 import com.example.emulator.HomebrewRomBuilder
 import com.example.emulator.cheats.CheatDecoder
@@ -18,6 +21,7 @@ import com.example.emulator.cheats.ZipCheatCandidate
 import com.example.emulator.shaders.ShaderEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -122,7 +126,7 @@ class RomRepository(
             val destFile = File(romsDir, "${baseName}_${meta.crc32Hex.take(6)}.gba")
             destFile.writeBytes(romBytes)
 
-            val entity = RomEntity(
+            val baseEntity = RomEntity(
                 title = meta.title,
                 gameCode = meta.gameCode,
                 makerCode = meta.makerCode,
@@ -132,6 +136,14 @@ class RomRepository(
                 sizeBytes = romBytes.size.toLong(),
                 saveType = meta.saveType.name,
                 isBuiltInDemo = false
+            )
+            val localMeta = GbaMetadataScraper.extractLocalMetadata(baseEntity, romBytes)
+            val entity = baseEntity.copy(
+                displayTitle = localMeta.displayTitle,
+                publisher = localMeta.publisher,
+                region = localMeta.region,
+                hardwareFeatures = localMeta.hardwareFeatures,
+                hasRumbleSupport = localMeta.hasRumbleSupport
             )
             val id = dao.insertRom(entity)
             entity.copy(id = id)
@@ -149,7 +161,7 @@ class RomRepository(
 
         val destFile = File(romsDir, "pixel_quest_demo.gba")
         destFile.writeBytes(romBytes)
-        val entity = RomEntity(
+        val baseEntity = RomEntity(
             title = meta.title,
             gameCode = meta.gameCode,
             makerCode = meta.makerCode,
@@ -159,6 +171,16 @@ class RomRepository(
             sizeBytes = romBytes.size.toLong(),
             saveType = meta.saveType.name,
             isBuiltInDemo = true
+        )
+        val localMeta = GbaMetadataScraper.extractLocalMetadata(baseEntity, romBytes)
+        val entity = baseEntity.copy(
+            displayTitle = localMeta.displayTitle,
+            publisher = localMeta.publisher,
+            region = localMeta.region,
+            releaseYear = localMeta.releaseYear,
+            genre = localMeta.genre,
+            hardwareFeatures = localMeta.hardwareFeatures,
+            hasRumbleSupport = localMeta.hasRumbleSupport
         )
         val id = dao.insertRom(entity)
 
@@ -174,6 +196,51 @@ class RomRepository(
             )
         )
         entity.copy(id = id)
+    }
+
+    suspend fun scrapeRomMetadata(rom: RomEntity): Result<RomEntity> = withContext(Dispatchers.IO) {
+        runCatching {
+            val bytes = runCatching { loadRomBytes(rom) }.getOrNull()
+            val scraped = GbaMetadataScraper.scrapeRomMetadata(context, rom, bytes)
+            val now = System.currentTimeMillis()
+            dao.updateRomMetadata(
+                romId = rom.id,
+                displayTitle = scraped.displayTitle,
+                publisher = scraped.publisher,
+                region = scraped.region,
+                releaseYear = scraped.releaseYear,
+                genre = scraped.genre,
+                hardwareFeatures = scraped.hardwareFeatures,
+                hasRumbleSupport = scraped.hasRumbleSupport,
+                coverArtPath = scraped.coverArtPath,
+                scrapedAt = if (scraped.scrapedFromRemote) now else rom.metadataScrapedAt
+            )
+            dao.getRomById(rom.id) ?: rom.copy(
+                displayTitle = scraped.displayTitle,
+                publisher = scraped.publisher,
+                region = scraped.region,
+                releaseYear = scraped.releaseYear,
+                genre = scraped.genre,
+                hardwareFeatures = scraped.hardwareFeatures,
+                hasRumbleSupport = scraped.hasRumbleSupport,
+                coverArtPath = scraped.coverArtPath,
+                metadataScrapedAt = if (scraped.scrapedFromRemote) now else rom.metadataScrapedAt
+            )
+        }
+    }
+
+    suspend fun scrapeAllRomsMetadata(): Result<Pair<Int, Int>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val all = dao.observeAllRoms().first()
+            var remoteMatches = 0
+            for (rom in all) {
+                val res = scrapeRomMetadata(rom).getOrNull()
+                if (res != null && (res.metadataScrapedAt > 0L || res.coverArtPath != null)) {
+                    remoteMatches++
+                }
+            }
+            all.size to remoteMatches
+        }
     }
 
     suspend fun loadRomBytes(rom: RomEntity): ByteArray = withContext(Dispatchers.IO) {
@@ -317,20 +384,23 @@ class RomRepository(
         dao.deleteCheatById(cheatId)
     }
 
-    suspend fun importBiosFromUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
-        runCatching {
-            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                ?: error("Cannot read BIOS file.")
-            require(bytes.size == 0x4000) { "GBA BIOS must be exactly 16 KB (16,384 bytes)." }
-            biosFile.writeBytes(bytes)
-            biosFile.absolutePath
+    suspend fun resolveBios(preferredMode: BiosMode, explicitPath: String?): BiosStatusInfo =
+        withContext(Dispatchers.IO) {
+            GbaBiosManager.autoResolveBios(context, preferredMode, explicitPath)
         }
+
+    suspend fun importBiosStatusFromUri(uri: Uri): Result<BiosStatusInfo> =
+        GbaBiosManager.importBiosFromUri(context, uri)
+
+    suspend fun scanFolderForBios(treeUri: Uri): Result<BiosStatusInfo> =
+        GbaBiosManager.scanFolderTreeForBios(context, treeUri)
+
+    suspend fun importBiosFromUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
+        GbaBiosManager.importBiosFromUri(context, uri).map { it.storedFilePath ?: biosFile.absolutePath }
     }
 
     suspend fun loadCustomBios(path: String?): ByteArray? = withContext(Dispatchers.IO) {
-        if (path.isNullOrBlank()) return@withContext null
-        val f = File(path)
-        if (f.exists() && f.length() == 0x4000L) f.readBytes() else null
+        GbaBiosManager.autoResolveBios(context, BiosMode.AUTO, path).bytes
     }
 
     private fun extractGbaFromBytes(raw: ByteArray, fileName: String): Pair<ByteArray, String> {

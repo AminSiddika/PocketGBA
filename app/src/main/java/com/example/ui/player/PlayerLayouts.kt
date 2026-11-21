@@ -120,6 +120,9 @@ fun PortraitConsoleLayout(
                             if (state.isTurboActive) AmberBoost else SurfaceCard,
                             if (state.isTurboActive) Color.Black else TextSecondary
                         )
+                        if (state.isRumbleActive) {
+                            BadgeChip("RUMBLE", CrimsonAction, Color.White)
+                        }
                     }
                 }
             }
@@ -382,6 +385,9 @@ fun LandscapeConsoleLayout(
                     if (state.isTurboActive) AmberBoost else Color.Black.copy(alpha = 0.65f),
                     if (state.isTurboActive) Color.Black else TextSecondary
                 )
+                if (state.isRumbleActive) {
+                    BadgeChip("RUMBLE", CrimsonAction, Color.White)
+                }
             }
         }
 

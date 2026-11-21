@@ -1,5 +1,6 @@
 package com.example.ui.library
 
+import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -12,6 +13,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,16 +29,23 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Gamepad
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Search
@@ -49,6 +59,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -74,6 +85,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -85,6 +97,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.data.db.RomEntity
 import com.example.data.db.ShaderProfileEntity
+import com.example.emulator.BiosMode
+import com.example.emulator.BiosStatusInfo
 import com.example.ui.player.CheatManagerSheet
 import com.example.ui.player.ShaderManagerSheet
 import com.example.ui.theme.AmberBoost
@@ -109,6 +123,7 @@ fun LibraryScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     var romPendingDelete by remember { mutableStateOf<RomEntity?>(null) }
     var showShadersSheet by remember { mutableStateOf(false) }
+    var showBiosDialog by remember { mutableStateOf(false) }
     var pendingExportShader by remember { mutableStateOf<ShaderProfileEntity?>(null) }
 
     LaunchedEffect(Unit) {
@@ -161,6 +176,18 @@ fun LibraryScreen(
         pendingExportShader = null
     }
 
+    val importBiosLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) viewModel.importBios(uri)
+    }
+
+    val scanBiosFolderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri != null) viewModel.scanBiosFolder(uri)
+    }
+
     Scaffold(
         containerColor = GraphiteBg,
         contentWindowInsets = WindowInsets.safeDrawing,
@@ -195,6 +222,31 @@ fun LibraryScreen(
                 },
                 actions = {
                     IconButton(
+                        onClick = { viewModel.scrapeAllMetadata() },
+                        enabled = !state.isScrapingMetadata,
+                        modifier = Modifier.testTag("toolbar_scrape_button")
+                    ) {
+                        if (state.isScrapingMetadata) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.CloudSync,
+                                contentDescription = "Scrape GBA Metadata & Box Art",
+                                tint = AmberBoost
+                            )
+                        }
+                    }
+                    IconButton(
+                        onClick = { showBiosDialog = true },
+                        modifier = Modifier.testTag("toolbar_bios_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Memory,
+                            contentDescription = "GBA BIOS Auto Configuration",
+                            tint = if (state.biosStatus.hasCustomBios) EmeraldLed else TextSecondary
+                        )
+                    }
+                    IconButton(
                         onClick = { showShadersSheet = true },
                         modifier = Modifier.testTag("toolbar_shaders_button")
                     ) {
@@ -207,16 +259,16 @@ fun LibraryScreen(
                     OutlinedButton(
                         onClick = { viewModel.launchBuiltInDemo { id -> onOpenPlayer(id, -1) } },
                         modifier = Modifier
-                            .padding(end = 12.dp)
+                            .padding(end = 10.dp)
                             .testTag("toolbar_demo_button"),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.SportsEsports,
                             contentDescription = "Launch homebrew demo",
                             modifier = Modifier.size(16.dp)
                         )
-                        Spacer(Modifier.width(6.dp))
+                        Spacer(Modifier.width(4.dp))
                         Text("Demo", style = MaterialTheme.typography.labelLarge)
                     }
                 }
@@ -312,6 +364,7 @@ fun LibraryScreen(
                                         onOpenPlayer(card.rom.id, resumeSlot)
                                     },
                                     onOpenCheats = { viewModel.openCheatManager(card.rom) },
+                                    onOpenInfo = { viewModel.openRomInfo(card.rom) },
                                     onDelete = { romPendingDelete = card.rom }
                                 )
                             }
@@ -394,6 +447,30 @@ fun LibraryScreen(
             }
         )
     }
+
+    state.inspectingRom?.let { rom ->
+        RomMetadataDialog(
+            rom = rom,
+            isScraping = state.isScrapingMetadata,
+            onScrape = { viewModel.scrapeSingleRom(rom) },
+            onDismiss = viewModel::closeRomInfo
+        )
+    }
+
+    if (showBiosDialog) {
+        BiosAutoDialog(
+            biosMode = state.biosMode,
+            biosStatus = state.biosStatus,
+            onSelectMode = viewModel::setBiosMode,
+            onImportFile = {
+                importBiosLauncher.launch(arrayOf("application/octet-stream", "application/zip", "*/*"))
+            },
+            onScanFolder = { scanBiosFolderLauncher.launch(null) },
+            onAutoDetect = viewModel::autoDetectBios,
+            onClear = viewModel::clearCustomBios,
+            onDismiss = { showBiosDialog = false }
+        )
+    }
 }
 
 @Composable
@@ -471,16 +548,28 @@ private fun EmptyShelfView(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun RomCartridgeCard(
     card: RomLibraryCard,
     onPlay: () -> Unit,
     onResumeAuto: () -> Unit,
     onOpenCheats: () -> Unit,
+    onOpenInfo: () -> Unit,
     onDelete: () -> Unit
 ) {
     val rom = card.rom
     val hasResumeSlot = card.hasSs0 || card.hasSs1 || card.hasSs2
+    val coverBitmap = remember(rom.coverArtPath) {
+        rom.coverArtPath?.let { path ->
+            runCatching { BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+        }
+    }
+    val metaSubtitle = buildList {
+        if (rom.publisher.isNotBlank()) add(rom.publisher)
+        if (rom.region.isNotBlank()) add(rom.region)
+        if (rom.releaseYear.isNotBlank()) add(rom.releaseYear)
+    }.joinToString(" • ")
 
     Card(
         shape = RoundedCornerShape(18.dp),
@@ -499,25 +588,34 @@ private fun RomCartridgeCard(
             ) {
                 Box(
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(54.dp)
                         .clip(RoundedCornerShape(12.dp))
                         .background(
                             Brush.linearGradient(listOf(HandheldIndigo, SurfaceElevated))
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Gamepad,
-                        contentDescription = "GBA Cartridge",
-                        tint = Color.White,
-                        modifier = Modifier.size(26.dp)
-                    )
+                    if (coverBitmap != null) {
+                        Image(
+                            bitmap = coverBitmap,
+                            contentDescription = "${rom.displayTitle ?: rom.title} Box Art",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Gamepad,
+                            contentDescription = "GBA Cartridge",
+                            tint = Color.White,
+                            modifier = Modifier.size(26.dp)
+                        )
+                    }
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = rom.title,
+                            text = rom.displayTitle ?: rom.title,
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
@@ -529,12 +627,39 @@ private fun RomCartridgeCard(
                             BadgeChip("DEMO", EmeraldLed.copy(alpha = 0.18f), EmeraldLed)
                         }
                     }
+                    if (metaSubtitle.isNotBlank()) {
+                        Text(
+                            text = metaSubtitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                     Spacer(Modifier.height(4.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
                         BadgeChip(rom.gameCode, SurfaceElevated, LuminousViolet)
                         BadgeChip(rom.saveType, SurfaceElevated, TextSecondary)
-                        BadgeChip(rom.crc32Hex, SurfaceElevated, TextSecondary)
+                        if (rom.hasRumbleSupport) {
+                            BadgeChip("RUMBLE", CrimsonAction.copy(alpha = 0.2f), CrimsonAction)
+                        }
+                        if (rom.hardwareFeatures.contains("RTC")) {
+                            BadgeChip("RTC", AmberBoost.copy(alpha = 0.18f), AmberBoost)
+                        }
                     }
+                }
+                IconButton(
+                    onClick = onOpenInfo,
+                    modifier = Modifier.testTag("info_rom_${rom.id}")
+                ) {
+                    Icon(
+                        Icons.Default.Info,
+                        contentDescription = "Cartridge metadata & scraper",
+                        tint = LuminousViolet
+                    )
                 }
                 IconButton(
                     onClick = onDelete,
@@ -684,3 +809,233 @@ fun formatDuration(seconds: Long): String {
     val hrs = mins / 60
     return if (hrs > 0) "${hrs}h ${mins % 60}m" else "${mins}m"
 }
+
+@Composable
+private fun RomMetadataDialog(
+    rom: RomEntity,
+    isScraping: Boolean,
+    onScrape: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val coverBitmap = remember(rom.coverArtPath) {
+        rom.coverArtPath?.let { path ->
+            runCatching { BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = SurfaceCard,
+        title = {
+            Text(
+                text = rom.displayTitle ?: rom.title,
+                style = MaterialTheme.typography.titleLarge,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (coverBitmap != null) {
+                    Image(
+                        bitmap = coverBitmap,
+                        contentDescription = "${rom.displayTitle ?: rom.title} Box Art",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(148.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(AnodizedSlate)
+                    )
+                }
+
+                MetadataInfoRow("Header Title", rom.title)
+                MetadataInfoRow("Serial", "AGB-${rom.gameCode}")
+                MetadataInfoRow("Publisher", rom.publisher.ifBlank { "Maker ${rom.makerCode}" })
+                MetadataInfoRow("Region", rom.region.ifBlank { "Unknown" })
+                if (rom.releaseYear.isNotBlank()) MetadataInfoRow("Release Year", rom.releaseYear)
+                if (rom.genre.isNotBlank()) MetadataInfoRow("Genre", rom.genre)
+                MetadataInfoRow("Save Hardware", rom.saveType)
+                MetadataInfoRow("CRC32", rom.crc32Hex)
+                MetadataInfoRow("Hardware", rom.hardwareFeatures.ifBlank { "Standard Cartridge" })
+                MetadataInfoRow("ROM Size", "${rom.sizeBytes / 1024} KB")
+
+                Spacer(Modifier.height(4.dp))
+                Button(
+                    onClick = onScrape,
+                    enabled = !isScraping,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("scrape_single_rom_button"),
+                    colors = ButtonDefaults.buttonColors(containerColor = HandheldIndigo),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    if (isScraping) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = Color.White
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Scraping No-Intro & Libretro...")
+                    } else {
+                        Icon(Icons.Default.CloudSync, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Scrape Metadata & Box Art")
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
+}
+
+@Composable
+private fun MetadataInfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+        Spacer(Modifier.width(12.dp))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun BiosAutoDialog(
+    biosMode: BiosMode,
+    biosStatus: BiosStatusInfo,
+    onSelectMode: (BiosMode) -> Unit,
+    onImportFile: () -> Unit,
+    onScanFolder: () -> Unit,
+    onAutoDetect: () -> Unit,
+    onClear: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = SurfaceCard,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Memory, contentDescription = null, tint = EmeraldLed)
+                Spacer(Modifier.width(8.dp))
+                Text("GBA BIOS Auto", style = MaterialTheme.typography.titleLarge)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Surface(
+                    color = AnodizedSlate,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (biosStatus.isOfficialNintendo) {
+                                Icon(
+                                    Icons.Default.CheckCircle,
+                                    contentDescription = "Official Nintendo BIOS Verified",
+                                    tint = EmeraldLed,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                            }
+                            Text(
+                                text = biosStatus.sourceLabel,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (biosStatus.hasCustomBios) EmeraldLed else Color.White
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = "Auto checks app storage for gba_bios.bin (16KB, CRC32 81977335) or extracts from .zip archives. Falls back safely to HLE BIOS if absent.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary
+                        )
+                    }
+                }
+
+                Text("BIOS Resolution Mode", style = MaterialTheme.typography.labelLarge)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(
+                        BiosMode.AUTO to "Auto",
+                        BiosMode.CUSTOM to "Custom",
+                        BiosMode.HLE to "HLE"
+                    ).forEach { (mode, label) ->
+                        FilterChip(
+                            selected = biosMode == mode,
+                            onClick = { onSelectMode(mode) },
+                            label = { Text(label) }
+                        )
+                    }
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = onImportFile,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("library_import_bios_button"),
+                        colors = ButtonDefaults.buttonColors(containerColor = HandheldIndigo)
+                    ) {
+                        Text("Import .bin/.zip", maxLines = 1)
+                    }
+                    OutlinedButton(
+                        onClick = onScanFolder,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("library_scan_bios_folder_button")
+                    ) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Scan Folder", maxLines = 1)
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = onAutoDetect,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Auto-Detect")
+                    }
+                    OutlinedButton(
+                        onClick = onClear,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Clear Custom", color = CrimsonAction)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Done")
+            }
+        }
+    )
+}
+

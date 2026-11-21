@@ -31,6 +31,7 @@ object GbaConstants {
     const val IRQ_TIMER1 = 1 shl 4
     const val IRQ_TIMER2 = 1 shl 5
     const val IRQ_TIMER3 = 1 shl 6
+    const val IRQ_SERIAL = 1 shl 7
     const val IRQ_DMA0 = 1 shl 8
     const val IRQ_DMA1 = 1 shl 9
     const val IRQ_DMA2 = 1 shl 10
@@ -64,4 +65,10 @@ enum class OrientationMode(val label: String) {
     AUTO("Auto Rotate"),
     PORTRAIT("Portrait Lock"),
     LANDSCAPE("Landscape Lock")
+}
+
+enum class BiosMode(val label: String, val description: String) {
+    AUTO("Auto", "Use custom 16KB gba_bios.bin if found, else built-in HLE BIOS"),
+    CUSTOM("Custom BIOS", "Require imported 16KB gba_bios.bin when available"),
+    HLE("HLE BIOS", "Always use built-in zero-setup HLE BIOS")
 }

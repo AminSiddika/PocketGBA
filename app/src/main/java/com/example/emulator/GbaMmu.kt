@@ -45,10 +45,24 @@ class GbaMmu {
     val dmaInternalDad = IntArray(4)
     val dmaInternalCount = IntArray(4)
 
-    // Audio FIFO callback
+    // Audio FIFO & Rumble callbacks
     var onFifoWrite: ((channel: Int, word: Int) -> Unit)? = null
     var onTimerOverflow: ((timerIndex: Int) -> Unit)? = null
+    var onRumbleChanged: ((active: Boolean) -> Unit)? = null
     var hasExternalBios = false
+
+    // Cartridge GPIO (0x080000C4..C8) & Rumble motor state
+    var gpioData = 0
+        private set
+    var gpioDirection = 0
+        private set
+    var gpioControl = 0
+        private set
+    @Volatile
+    var rumbleActive = false
+        private set
+    var rumbleEventsCount = 0L
+        private set
 
     // Internal affine BG reference latches (BG2X/Y, BG3X/Y)
     var bg2RefX = 0
@@ -90,6 +104,11 @@ class GbaMmu {
         bg2RefY = 0
         bg3RefX = 0
         bg3RefY = 0
+        gpioData = 0
+        gpioDirection = 0
+        gpioControl = 0
+        updateRumbleState(false)
+        rumbleEventsCount = 0L
 
         if (customBios != null && customBios.size >= 0x4000) {
             System.arraycopy(customBios, 0, bios, 0, 0x4000)
@@ -143,7 +162,9 @@ class GbaMmu {
             0x07 -> oam[address and 0x3FF].toInt() and 0xFF
             0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D -> {
                 val off = address and 0x01FFFFFF
-                if (off < rom.size) rom[off].toInt() and 0xFF else ((off ushr 1) and 0xFF)
+                if ((gpioControl and 1) != 0 && off in 0xC4..0xC9) {
+                    readGpioHalfword(off and 0xFFFFFFFE.toInt()) ushr ((address and 1) * 8) and 0xFF
+                } else if (off < rom.size) rom[off].toInt() and 0xFF else ((off ushr 1) and 0xFF)
             }
             0x0E, 0x0F -> readSram8(address and 0xFFFF)
             else -> 0
@@ -182,7 +203,9 @@ class GbaMmu {
             }
             0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D -> {
                 val o = aligned and 0x01FFFFFF
-                if (o + 1 < rom.size) {
+                if ((gpioControl and 1) != 0 && (o == 0xC4 || o == 0xC6 || o == 0xC8)) {
+                    readGpioHalfword(o)
+                } else if (o + 1 < rom.size) {
                     (rom[o].toInt() and 0xFF) or ((rom[o + 1].toInt() and 0xFF) shl 8)
                 } else {
                     (o ushr 1) and 0xFFFF
@@ -288,6 +311,12 @@ class GbaMmu {
                     vram[o + 1] = v
                 }
             }
+            0x08, 0x09 -> {
+                val o = address and 0x01FFFFFF
+                if (o == 0xC4 || o == 0xC6 || o == 0xC8) {
+                    writeGpioHalfword(o, value and 0xFF)
+                }
+            }
             0x0E, 0x0F -> writeSram8(address and 0xFFFF, value and 0xFF)
         }
     }
@@ -324,6 +353,12 @@ class GbaMmu {
                 val o = aligned and 0x3FF
                 oam[o] = b0
                 oam[o + 1] = b1
+            }
+            0x08, 0x09 -> {
+                val o = aligned and 0x01FFFFFF
+                if (o == 0xC4 || o == 0xC6 || o == 0xC8) {
+                    writeGpioHalfword(o, value and 0xFFFF)
+                }
             }
             0x0E, 0x0F -> writeSram8(aligned and 0xFFFF, value and 0xFF)
         }
@@ -368,6 +403,15 @@ class GbaMmu {
             0x07 -> {
                 val o = aligned and 0x3FF
                 oam[o] = b0; oam[o + 1] = b1; oam[o + 2] = b2; oam[o + 3] = b3
+            }
+            0x08, 0x09 -> {
+                val o = aligned and 0x01FFFFFF
+                if (o == 0xC4 || o == 0xC6 || o == 0xC8) {
+                    writeGpioHalfword(o, value and 0xFFFF)
+                }
+                if (o + 2 == 0xC6 || o + 2 == 0xC8) {
+                    writeGpioHalfword(o + 2, (value ushr 16) and 0xFFFF)
+                }
             }
             0x0E, 0x0F -> writeSram8(aligned and 0xFFFF, value and 0xFF)
         }
@@ -485,6 +529,24 @@ class GbaMmu {
             0x038, 0x03A -> bg3RefX = signExtend28(readIo32Raw(0x038))
             0x03C, 0x03E -> bg3RefY = signExtend28(readIo32Raw(0x03C))
 
+            // Serial SIOCNT (0x128) — Game Boy Player / Link Rumble handshake handling
+            0x128 -> {
+                if ((value and 0x0080) != 0) {
+                    val data32 = readIo32Raw(0x120)
+                    // Game Boy Player rumble control packets (0x40000010 / 0x0022xxxx / 0x80000001)
+                    if ((data32 and 0xFFFF0000.toInt()) == 0x40000000) {
+                        updateRumbleState((data32 and 0x01) != 0)
+                    } else if ((data32 ushr 16) == 0x0022) {
+                        updateRumbleState((data32 and 0x01) != 0)
+                    }
+                    // Complete transfer immediately & raise IRQ_SERIAL if bit 14 set
+                    writeIo16Raw(0x128, value and 0xFF7F)
+                    if ((value and 0x4000) != 0) {
+                        raiseIrq(GbaConstants.IRQ_SERIAL)
+                    }
+                }
+            }
+
             // DMA channels 0..3
             in 0x0B0..0x0DF -> {
                 val ch = (o - 0x0B0) / 12
@@ -510,6 +572,35 @@ class GbaMmu {
                     }
                 }
             }
+        }
+    }
+
+    private fun readGpioHalfword(offset: Int): Int = when (offset) {
+        0xC4 -> gpioData and 0x0F
+        0xC6 -> gpioDirection and 0x0F
+        0xC8 -> gpioControl and 0x01
+        else -> 0
+    }
+
+    private fun writeGpioHalfword(offset: Int, value: Int) {
+        when (offset) {
+            0xC4 -> {
+                gpioData = value and 0x0F
+                val outputMask = if (gpioDirection == 0) 0x08 else gpioDirection
+                if ((outputMask and 0x08) != 0) {
+                    updateRumbleState((gpioData and 0x08) != 0)
+                }
+            }
+            0xC6 -> gpioDirection = value and 0x0F
+            0xC8 -> gpioControl = value and 0x01
+        }
+    }
+
+    private fun updateRumbleState(active: Boolean) {
+        if (rumbleActive != active) {
+            rumbleActive = active
+            if (active) rumbleEventsCount++
+            onRumbleChanged?.invoke(active)
         }
     }
 
@@ -743,6 +834,9 @@ class GbaMmu {
             out.writeInt(dmaInternalDad[i])
             out.writeInt(dmaInternalCount[i])
         }
+        out.writeInt(gpioData)
+        out.writeInt(gpioDirection)
+        out.writeInt(gpioControl)
     }
 
     fun restoreFrom(inp: DataInputStream) {
@@ -775,6 +869,17 @@ class GbaMmu {
             dmaInternalSad[i] = inp.readInt()
             dmaInternalDad[i] = inp.readInt()
             dmaInternalCount[i] = inp.readInt()
+        }
+        try {
+            gpioData = inp.readInt()
+            gpioDirection = inp.readInt()
+            gpioControl = inp.readInt()
+            updateRumbleState((gpioData and 0x08) != 0 && ((gpioDirection and 0x08) != 0 || gpioDirection == 0))
+        } catch (_: java.io.EOFException) {
+            gpioData = 0
+            gpioDirection = 0
+            gpioControl = 0
+            updateRumbleState(false)
         }
         sramDirty = true
     }

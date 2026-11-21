@@ -15,11 +15,14 @@ import com.example.data.db.RomEntity
 import com.example.data.db.ShaderProfileEntity
 import com.example.data.savestate.SaveStateRepository
 import com.example.data.savestate.SaveStateSlotInfo
+import com.example.emulator.BiosMode
+import com.example.emulator.BiosStatusInfo
 import com.example.emulator.CoreTelemetry
 import com.example.emulator.GbaConstants
 import com.example.emulator.GbaCore
 import com.example.emulator.GbaRomMetadata
 import com.example.emulator.OrientationMode
+import com.example.emulator.RumbleHapticEngine
 import com.example.emulator.SaveType
 import com.example.emulator.SpeedToggleMode
 import com.example.emulator.cheats.CheatDecoder
@@ -52,6 +55,7 @@ data class EmulatorUiState(
     val errorMessage: String? = null,
     val isPaused: Boolean = false,
     val isTurboActive: Boolean = false,
+    val isRumbleActive: Boolean = false,
     val currentSpeedMultiplier: Float = 1f,
     val speedStepBanner: String? = null,
     val fps: Int = 0,
@@ -61,6 +65,7 @@ data class EmulatorUiState(
     val zipCandidates: List<ZipCheatCandidate> = emptyList(),
     val shaderProfiles: List<ShaderProfileEntity> = emptyList(),
     val activeShaderProfile: ShaderProfileEntity = ShaderEngine.builtInProfiles()[1],
+    val biosStatus: BiosStatusInfo = BiosStatusInfo(),
     val preferences: EmulatorPreferences = EmulatorPreferences(),
     val toastMessage: String? = null
 )
@@ -72,6 +77,7 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     private val prefsRepo = PreferencesRepository(application)
 
     private val core = GbaCore()
+    private val rumbleEngine = RumbleHapticEngine(application)
     private val lock = Any()
     private val exitSaveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -104,15 +110,26 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                     prefsRepo.setActiveShaderProfileId(defaultLcd.id)
                 }
 
+                val biosStatus = romRepo.resolveBios(prefs.biosMode, prefs.customBiosPath)
+                if (biosStatus.storedFilePath != null && prefs.customBiosPath != biosStatus.storedFilePath) {
+                    prefsRepo.setCustomBiosPath(biosStatus.storedFilePath)
+                }
+
                 _uiState.update { state ->
                     val targetSpeed = effectiveTargetSpeed(state.rom, prefs)
                     val mult = if (state.isTurboActive) targetSpeed else 1f
                     val resolvedProfile = resolveShaderProfile(state.rom, prefs, profiles)
                     syncApuOutput(prefs, mult)
+                    if (!prefs.rumbleEnabled || state.isPaused) {
+                        rumbleEngine.stop()
+                    } else if (core.mmu.rumbleActive) {
+                        rumbleEngine.setRumble(true, true, prefs.rumbleIntensity)
+                    }
                     state.copy(
                         preferences = prefs,
                         shaderProfiles = profiles,
                         activeShaderProfile = resolvedProfile,
+                        biosStatus = biosStatus,
                         currentSpeedMultiplier = mult
                     )
                 }
@@ -162,13 +179,17 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
             }
 
             try {
+                val prefs = _uiState.value.preferences
                 val romBytes = romRepo.loadRomBytes(rom)
                 val saveType = runCatching { SaveType.valueOf(rom.saveType) }.getOrDefault(SaveType.SRAM)
                 val sramBytes = saveRepo.loadBatterySram(rom.baseName)
-                val customBios = romRepo.loadCustomBios(_uiState.value.preferences.customBiosPath)
+                val biosStatus = romRepo.resolveBios(prefs.biosMode, prefs.customBiosPath)
+                if (biosStatus.storedFilePath != null && prefs.customBiosPath != biosStatus.storedFilePath) {
+                    prefsRepo.setCustomBiosPath(biosStatus.storedFilePath)
+                }
 
                 val meta = GbaRomMetadata(
-                    title = rom.title,
+                    title = rom.displayTitle ?: rom.title,
                     gameCode = rom.gameCode,
                     makerCode = rom.makerCode,
                     crc32Hex = rom.crc32Hex,
@@ -178,7 +199,18 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                 )
 
                 synchronized(lock) {
-                    core.loadRom(romBytes, saveType, sramBytes, customBios)
+                    core.mmu.onRumbleChanged = { active ->
+                        val p = _uiState.value.preferences
+                        rumbleEngine.setRumble(active, p.rumbleEnabled && !_uiState.value.isPaused, p.rumbleIntensity)
+                        _uiState.update { it.copy(isRumbleActive = active) }
+                    }
+                    core.loadRom(
+                        romBytes = romBytes,
+                        saveType = saveType,
+                        initialSram = sramBytes,
+                        customBios = biosStatus.bytes,
+                        skipBiosIntro = prefs.skipBiosIntro
+                    )
                     core.onVBlankCheatHook = { mmu ->
                         if (_uiState.value.preferences.masterCheatsEnabled && compiledCheats.isNotEmpty()) {
                             CheatDecoder.executeAll(compiledCheats, mmu)
@@ -222,6 +254,8 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                         metadata = meta,
                         isLoading = false,
                         isPaused = false,
+                        isRumbleActive = core.mmu.rumbleActive,
+                        biosStatus = biosStatus,
                         slots = slots,
                         activeShaderProfile = resolvedProfile,
                         telemetry = core.getTelemetry(),
@@ -307,7 +341,13 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                     val elapsedSec = (now - lastFpsAt) / 1000.0
                     val measuredFps = (frameCounter / elapsedSec).toInt()
                     val tel = synchronized(lock) { core.getTelemetry() }
-                    _uiState.update { it.copy(fps = measuredFps, telemetry = tel) }
+                    _uiState.update {
+                        it.copy(
+                            fps = measuredFps,
+                            telemetry = tel,
+                            isRumbleActive = tel.rumbleActive
+                        )
+                    }
                     frameCounter = 0
                     lastFpsAt = now
                 }
@@ -339,10 +379,19 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun togglePause() {
-        _uiState.update { it.copy(isPaused = !it.isPaused) }
+        val next = !_uiState.value.isPaused
+        setPaused(next)
     }
 
     fun setPaused(paused: Boolean) {
+        if (paused) {
+            rumbleEngine.stop()
+        } else {
+            val prefs = _uiState.value.preferences
+            if (core.mmu.rumbleActive && prefs.rumbleEnabled) {
+                rumbleEngine.setRumble(true, true, prefs.rumbleIntensity)
+            }
+        }
         _uiState.update { it.copy(isPaused = paused) }
     }
 
@@ -444,10 +493,17 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     fun resetConsole() {
         viewModelScope.launch {
             val rom = _uiState.value.rom ?: return@launch
+            rumbleEngine.stop()
             synchronized(lock) {
-                core.cpu.resetToRomEntry()
+                core.cpu.resetToRomEntry(_uiState.value.preferences.skipBiosIntro)
             }
-            _uiState.update { it.copy(isPaused = false, toastMessage = "Console reset (${rom.title})") }
+            _uiState.update {
+                it.copy(
+                    isPaused = false,
+                    isRumbleActive = false,
+                    toastMessage = "Console reset (${rom.displayTitle ?: rom.title})"
+                )
+            }
         }
     }
 
@@ -672,7 +728,7 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    // === SHADERS STUDIO & SETTINGS ===
+    // === SHADERS STUDIO, RUMBLE, BIOS AUTO & SETTINGS ===
 
     fun selectGlobalShaderProfile(profile: ShaderProfileEntity) {
         viewModelScope.launch {
@@ -780,6 +836,25 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
         prefsRepo.setHapticsEnabled(enabled)
     }
 
+    fun setRumbleEnabled(enabled: Boolean) = viewModelScope.launch {
+        prefsRepo.setRumbleEnabled(enabled)
+        if (!enabled) rumbleEngine.stop()
+    }
+
+    fun setRumbleIntensity(intensity: Float) = viewModelScope.launch {
+        prefsRepo.setRumbleIntensity(intensity)
+    }
+
+    fun testRumble() {
+        rumbleEngine.pulseTest(_uiState.value.preferences.rumbleIntensity)
+        _uiState.update {
+            it.copy(
+                toastMessage = if (rumbleEngine.hasVibrator) "Rumble motor pulse sent"
+                else "Device has no hardware vibrator"
+            )
+        }
+    }
+
     fun setControlOpacity(opacity: Float) = viewModelScope.launch {
         prefsRepo.setControlOpacity(opacity)
     }
@@ -792,15 +867,67 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
         prefsRepo.setMasterCheatsEnabled(enabled)
     }
 
+    fun setBiosMode(mode: BiosMode) = viewModelScope.launch {
+        prefsRepo.setBiosMode(mode)
+        _uiState.update { it.copy(toastMessage = "BIOS mode: ${mode.label} (takes effect on reset)") }
+    }
+
+    fun setSkipBiosIntro(skip: Boolean) = viewModelScope.launch {
+        prefsRepo.setSkipBiosIntro(skip)
+    }
+
+    fun autoDetectBios() {
+        viewModelScope.launch {
+            prefsRepo.setBiosMode(BiosMode.AUTO)
+            val status = romRepo.resolveBios(BiosMode.AUTO, _uiState.value.preferences.customBiosPath)
+            if (status.storedFilePath != null) {
+                prefsRepo.setCustomBiosPath(status.storedFilePath)
+            }
+            _uiState.update {
+                it.copy(
+                    biosStatus = status,
+                    toastMessage = if (status.hasCustomBios) "Auto-detected ${status.sourceLabel}"
+                    else "No custom gba_bios.bin found — using HLE BIOS"
+                )
+            }
+        }
+    }
+
+    fun scanBiosFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            romRepo.scanFolderForBios(treeUri)
+                .onSuccess { status ->
+                    prefsRepo.setBiosMode(BiosMode.AUTO)
+                    prefsRepo.setCustomBiosPath(status.storedFilePath)
+                    _uiState.update {
+                        it.copy(
+                            biosStatus = status,
+                            toastMessage = "Found & loaded ${status.sourceLabel} (takes effect on reset)"
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    _uiState.update { it.copy(toastMessage = err.message ?: "BIOS folder scan failed.") }
+                }
+        }
+    }
+
     fun importBios(uri: Uri) {
         viewModelScope.launch {
-            val res = romRepo.importBiosFromUri(uri)
-            res.onSuccess { path ->
-                prefsRepo.setCustomBiosPath(path)
-                _uiState.update { it.copy(toastMessage = "Imported 16KB GBA BIOS (takes effect on reset)") }
-            }.onFailure { err ->
-                _uiState.update { it.copy(toastMessage = err.message ?: "BIOS import failed.") }
-            }
+            romRepo.importBiosStatusFromUri(uri)
+                .onSuccess { status ->
+                    prefsRepo.setBiosMode(BiosMode.AUTO)
+                    prefsRepo.setCustomBiosPath(status.storedFilePath)
+                    _uiState.update {
+                        it.copy(
+                            biosStatus = status,
+                            toastMessage = "Imported ${status.sourceLabel} (takes effect on reset)"
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    _uiState.update { it.copy(toastMessage = err.message ?: "BIOS import failed.") }
+                }
         }
     }
 
@@ -808,7 +935,12 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _uiState.value.preferences.customBiosPath?.let { File(it).delete() }
             prefsRepo.setCustomBiosPath(null)
-            _uiState.update { it.copy(toastMessage = "Reverted to built-in HLE BIOS") }
+            _uiState.update {
+                it.copy(
+                    biosStatus = BiosStatusInfo(resolvedMode = BiosMode.HLE, sourceLabel = "Auto: Built-in HLE BIOS"),
+                    toastMessage = "Cleared custom BIOS — using built-in HLE BIOS"
+                )
+            }
         }
     }
 
@@ -817,10 +949,11 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun flushAndPause() {
+        rumbleEngine.stop()
         val state = _uiState.value
         val rom = state.rom ?: return
         val meta = state.metadata
-        _uiState.update { it.copy(isPaused = true) }
+        _uiState.update { it.copy(isPaused = true, isRumbleActive = false) }
 
         val now = System.currentTimeMillis()
         val shouldAutoSave = state.preferences.autoSaveOnExit &&
@@ -858,6 +991,7 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
         emuJob?.cancel()
         cheatsObserveJob?.cancel()
         bannerJob?.cancel()
+        rumbleEngine.stop()
         core.apu.release()
         super.onCleared()
     }

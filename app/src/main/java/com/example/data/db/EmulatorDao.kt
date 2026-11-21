@@ -45,6 +45,34 @@ interface EmulatorDao {
     @Query("UPDATE roms SET preferredShaderProfileId = :shaderProfileId, preferredSpeedMultiplier = :speedMultiplier WHERE id = :romId")
     suspend fun updateRomOverrides(romId: Long, shaderProfileId: Long?, speedMultiplier: Float?)
 
+    @Query(
+        """
+        UPDATE roms SET
+            displayTitle = :displayTitle,
+            publisher = :publisher,
+            region = :region,
+            releaseYear = :releaseYear,
+            genre = :genre,
+            hardwareFeatures = :hardwareFeatures,
+            hasRumbleSupport = :hasRumbleSupport,
+            coverArtPath = :coverArtPath,
+            metadataScrapedAt = :scrapedAt
+        WHERE id = :romId
+        """
+    )
+    suspend fun updateRomMetadata(
+        romId: Long,
+        displayTitle: String?,
+        publisher: String,
+        region: String,
+        releaseYear: String,
+        genre: String,
+        hardwareFeatures: String,
+        hasRumbleSupport: Boolean,
+        coverArtPath: String?,
+        scrapedAt: Long
+    )
+
     // Cheats
     @Query("SELECT * FROM cheats WHERE romId = :romId ORDER BY groupName ASC, createdAt ASC")
     fun observeCheatsForRom(romId: Long): Flow<List<CheatEntity>>
