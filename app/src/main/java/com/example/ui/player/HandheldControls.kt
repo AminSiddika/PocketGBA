@@ -7,9 +7,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,6 +29,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +60,10 @@ import com.example.ui.theme.SurfaceCard
 import com.example.ui.theme.SurfaceElevated
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 /**
  * Multi-touch 8-way Cross D-Pad tracking active pointer position.
@@ -247,8 +252,8 @@ fun TactileActionButton(
 
 /**
  * Pizza Boy-style ergonomic Speed Toggle button placed directly beside the control pad.
- * Tap toggles 1x <-> target speed (up to 8x) or holds when SpeedToggleMode.HOLD is active;
- * long-press cycles target speed (2x -> 4x -> 6x -> 8x).
+ * - Tap toggles 1x <-> target speed (or Hold-to-Boost when SpeedToggleMode.HOLD is selected).
+ * - Swipe (up/right = faster, down/left = slower) or Long-Press cycles target speed (1.5x..8x).
  */
 @Composable
 fun SpeedTogglePadButton(
@@ -259,83 +264,123 @@ fun SpeedTogglePadButton(
     hapticsEnabled: Boolean,
     onToggle: () -> Unit,
     onHoldChange: (Boolean) -> Unit,
-    onCycleSpeed: () -> Unit,
+    onStepSpeed: (Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val haptics = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
     val bgColor by animateColorAsState(
-        targetValue = if (isTurboActive) AmberBoost.copy(alpha = 0.92f) else SurfaceCard.copy(alpha = opacity),
+        targetValue = if (isTurboActive) AmberBoost.copy(alpha = 0.94f) else SurfaceCard.copy(alpha = opacity),
         label = "speedBg"
     )
     val borderColor by animateColorAsState(
         targetValue = if (isTurboActive) AmberBoost else BorderSubtle.copy(alpha = opacity),
         label = "speedBorder"
     )
-    val scale by animateFloatAsState(targetValue = if (isTurboActive) 1.04f else 1f, label = "speedScale")
+    val scale by animateFloatAsState(targetValue = if (isTurboActive) 1.05f else 1f, label = "speedScale")
 
     val speedLabel = if (targetSpeed % 1f == 0f) "${targetSpeed.toInt()}x" else "${targetSpeed}x"
 
     Box(
         modifier = modifier
             .scale(scale)
-            .size(width = 58.dp, height = 48.dp)
+            .size(width = 62.dp, height = 50.dp)
             .clip(RoundedCornerShape(14.dp))
             .background(bgColor)
             .border(1.5.dp, borderColor, RoundedCornerShape(14.dp))
             .testTag("pad_speed_toggle")
-            .then(
-                if (mode == SpeedToggleMode.HOLD) {
-                    Modifier.pointerInput(hapticsEnabled) {
-                        awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false)
-                            if (hapticsEnabled) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onHoldChange(true)
-                            while (true) {
-                                val ev = awaitPointerEvent()
-                                val ch = ev.changes.firstOrNull { it.id == down.id }
-                                if (ch == null || !ch.pressed) {
+            .pointerInput(mode, hapticsEnabled) {
+                val swipeThresholdPx = 22.dp.toPx()
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val pointerId = down.id
+                    val startPos = down.position
+                    var gestureHandled = false
+                    var longPressJob: Job? = null
+
+                    if (mode == SpeedToggleMode.HOLD) {
+                        if (hapticsEnabled) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onHoldChange(true)
+                    } else {
+                        longPressJob = scope.launch {
+                            delay(420L)
+                            gestureHandled = true
+                            if (hapticsEnabled) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onStepSpeed(1)
+                        }
+                    }
+
+                    try {
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val ch = ev.changes.firstOrNull { it.id == pointerId }
+                            if (ch == null || !ch.pressed) {
+                                longPressJob?.cancel()
+                                if (mode == SpeedToggleMode.HOLD) {
                                     onHoldChange(false)
-                                    break
+                                } else if (!gestureHandled) {
+                                    if (hapticsEnabled) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onToggle()
+                                }
+                                break
+                            }
+
+                            if (!gestureHandled) {
+                                val dx = ch.position.x - startPos.x
+                                val dy = ch.position.y - startPos.y
+                                if (abs(dx) > swipeThresholdPx || abs(dy) > swipeThresholdPx) {
+                                    longPressJob?.cancel()
+                                    gestureHandled = true
+                                    val delta = if (abs(dx) >= abs(dy)) {
+                                        if (dx > 0f) 1 else -1
+                                    } else {
+                                        if (dy < 0f) 1 else -1
+                                    }
+                                    if (hapticsEnabled) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onStepSpeed(delta)
+                                    ch.consume()
                                 }
                             }
                         }
-                    }
-                } else {
-                    Modifier.pointerInput(hapticsEnabled) {
-                        detectTapGestures(
-                            onTap = {
-                                if (hapticsEnabled) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onToggle()
-                            },
-                            onLongPress = {
-                                if (hapticsEnabled) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                onCycleSpeed()
-                            }
-                        )
+                    } finally {
+                        longPressJob?.cancel()
                     }
                 }
-            ),
+            },
         contentAlignment = Alignment.Center
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
             modifier = Modifier.padding(horizontal = 4.dp)
         ) {
-            Icon(
-                imageVector = Icons.Default.Bolt,
-                contentDescription = "Fast Forward Toggle",
-                tint = if (isTurboActive) Color.Black else AmberBoost,
-                modifier = Modifier.size(16.dp)
-            )
-            Spacer(Modifier.width(2.dp))
-            Text(
-                text = if (isTurboActive) speedLabel else "SPD",
-                style = MaterialTheme.typography.labelMedium,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = if (isTurboActive) Color.Black else TextPrimary
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Bolt,
+                    contentDescription = "Fast Forward Toggle",
+                    tint = if (isTurboActive) Color.Black else AmberBoost,
+                    modifier = Modifier.size(15.dp)
+                )
+                Spacer(Modifier.width(1.dp))
+                Text(
+                    text = if (isTurboActive) speedLabel else "SPD",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (isTurboActive) Color.Black else TextPrimary
+                )
+            }
+            if (!isTurboActive) {
+                Text(
+                    text = speedLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = 9.sp,
+                    color = TextSecondary
+                )
+            }
         }
     }
 }

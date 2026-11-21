@@ -33,5 +33,14 @@ data class ParsedChtEntry(
     val code: String,
     val format: CheatFormat,
     val enabled: Boolean,
-    val sourceFormat: String
+    val sourceFormat: String,
+    val groupName: String = "Imported Pack"
+)
+
+data class CheatPreviewResult(
+    val isValid: Boolean,
+    val detectedFormat: CheatFormat,
+    val summary: String,
+    val lineCount: Int,
+    val invalidLines: List<String>
 )

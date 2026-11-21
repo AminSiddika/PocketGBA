@@ -8,8 +8,10 @@ import android.view.KeyEvent
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,31 +20,18 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.BookmarkAdd
-import androidx.compose.material.icons.filled.Bookmarks
-import androidx.compose.material.icons.filled.Code
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.RestartAlt
-import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -59,10 +48,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -70,31 +57,23 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.db.ShaderProfileEntity
 import com.example.emulator.GbaConstants
 import com.example.emulator.OrientationMode
-import com.example.ui.library.BadgeChip
 import com.example.ui.theme.AmberBoost
-import com.example.ui.theme.AnodizedSlate
-import com.example.ui.theme.BorderSubtle
 import com.example.ui.theme.CrimsonAction
-import com.example.ui.theme.EmeraldLed
 import com.example.ui.theme.GraphiteBg
 import com.example.ui.theme.HandheldIndigo
-import com.example.ui.theme.LuminousViolet
-import com.example.ui.theme.SurfaceCard
-import com.example.ui.theme.SurfaceElevated
-import com.example.ui.theme.TextMuted
-import com.example.ui.theme.TextSecondary
 
 @Composable
 fun PlayerScreen(
     romId: Long,
+    initialLoadSlot: Int = -1,
     viewModel: EmulatorViewModel,
     onBack: () -> Unit
 ) {
@@ -107,9 +86,11 @@ fun PlayerScreen(
     val focusRequester = remember { FocusRequester() }
 
     var showSaveStatesSheet by remember { mutableStateOf(false) }
+    var showShadersSheet by remember { mutableStateOf(false) }
     var showCheatsSheet by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
     var pendingTransferSlot by remember { mutableIntStateOf(1) }
+    var pendingExportShader by remember { mutableStateOf<ShaderProfileEntity?>(null) }
 
     // Input mask tracking across touch & physical keyboard/gamepad
     var dpadMask by remember { mutableIntStateOf(0) }
@@ -138,8 +119,8 @@ fun PlayerScreen(
         viewModel.updateKeyMask(combinedMask)
     }
 
-    LaunchedEffect(romId) {
-        viewModel.loadRomSession(romId)
+    LaunchedEffect(romId, initialLoadSlot) {
+        viewModel.loadRomSession(romId, initialLoadSlot)
     }
 
     LaunchedEffect(Unit) {
@@ -204,6 +185,22 @@ fun PlayerScreen(
         contract = ActivityResultContracts.CreateDocument("text/plain")
     ) { uri ->
         if (uri != null) viewModel.exportCheatsToUri(uri)
+    }
+
+    val importShaderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) viewModel.importShaderFile(uri)
+    }
+
+    val exportShaderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        val profile = pendingExportShader
+        if (uri != null && profile != null) {
+            viewModel.exportShaderProfile(profile, uri)
+        }
+        pendingExportShader = null
     }
 
     val importBiosLauncher = rememberLauncherForActivityResult(
@@ -277,6 +274,10 @@ fun PlayerScreen(
                             viewModel.setPaused(true)
                             showSaveStatesSheet = true
                         },
+                        onOpenShaders = {
+                            viewModel.setPaused(true)
+                            showShadersSheet = true
+                        },
                         onOpenCheats = {
                             viewModel.setPaused(true)
                             showCheatsSheet = true
@@ -291,7 +292,7 @@ fun PlayerScreen(
                         onSelectChange = { selectPressed = it },
                         onTurboToggle = viewModel::toggleTurbo,
                         onTurboHold = viewModel::setTurboHeld,
-                        onCycleSpeed = viewModel::cycleFastForwardSpeed
+                        onStepSpeed = viewModel::stepFastForwardSpeed
                     )
                 } else {
                     PortraitConsoleLayout(
@@ -308,6 +309,10 @@ fun PlayerScreen(
                             viewModel.setPaused(true)
                             showSaveStatesSheet = true
                         },
+                        onOpenShaders = {
+                            viewModel.setPaused(true)
+                            showShadersSheet = true
+                        },
                         onOpenCheats = {
                             viewModel.setPaused(true)
                             showCheatsSheet = true
@@ -322,7 +327,45 @@ fun PlayerScreen(
                         onSelectChange = { selectPressed = it },
                         onTurboToggle = viewModel::toggleTurbo,
                         onTurboHold = viewModel::setTurboHeld,
-                        onCycleSpeed = viewModel::cycleFastForwardSpeed
+                        onStepSpeed = viewModel::stepFastForwardSpeed
+                    )
+                }
+            }
+        }
+
+        // Transient Speed-Step HUD Banner when tapping or swiping/long-pressing SPD
+        AnimatedVisibility(
+            visible = state.speedStepBanner != null,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(top = 48.dp)
+        ) {
+            Surface(
+                color = AmberBoost,
+                shape = RoundedCornerShape(20.dp),
+                shadowElevation = 6.dp,
+                modifier = Modifier.testTag("speed_step_banner")
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Bolt,
+                        contentDescription = null,
+                        tint = Color.Black,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = state.speedStepBanner.orEmpty(),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.Black
                     )
                 }
             }
@@ -363,6 +406,30 @@ fun PlayerScreen(
         )
     }
 
+    if (showShadersSheet) {
+        ShaderManagerSheet(
+            previewBitmap = frameBitmap,
+            profiles = state.shaderProfiles,
+            activeGlobalProfileId = state.preferences.activeShaderProfileId,
+            currentRom = state.rom,
+            onDismiss = {
+                showShadersSheet = false
+                viewModel.setPaused(false)
+            },
+            onSelectGlobalProfile = viewModel::selectGlobalShaderProfile,
+            onPinProfileToRom = viewModel::pinShaderToCurrentRom,
+            onSaveProfile = viewModel::saveShaderProfile,
+            onDeleteCustomProfile = viewModel::deleteCustomShaderProfile,
+            onImportShaderFile = {
+                importShaderLauncher.launch(arrayOf("text/plain", "application/json", "application/octet-stream", "*/*"))
+            },
+            onExportProfile = { profile ->
+                pendingExportShader = profile
+                exportShaderLauncher.launch("${profile.name.replace(" ", "_").lowercase()}.json")
+            }
+        )
+    }
+
     if (showCheatsSheet) {
         CheatManagerSheet(
             romTitle = state.rom?.title ?: "GBA Cartridge",
@@ -375,6 +442,7 @@ fun PlayerScreen(
             },
             onToggleMaster = viewModel::setMasterCheatsEnabled,
             onToggleCheat = viewModel::toggleCheat,
+            onToggleGroup = viewModel::toggleCheatGroup,
             onSetAllEnabled = viewModel::setAllCheatsEnabled,
             onSaveCheat = viewModel::addOrEditCheat,
             onDeleteCheat = viewModel::deleteCheat,
@@ -393,12 +461,20 @@ fun PlayerScreen(
     if (showSettingsSheet) {
         ShaderAndSettingsSheet(
             preferences = state.preferences,
+            activeShaderProfile = state.activeShaderProfile,
+            currentRom = state.rom,
             onDismiss = { showSettingsSheet = false },
-            onSelectShader = viewModel::setShader,
+            onOpenShadersManager = {
+                showSettingsSheet = false
+                viewModel.setPaused(true)
+                showShadersSheet = true
+            },
             onSelectSpeed = viewModel::setFastForwardSpeed,
+            onSetRomSpeedOverride = viewModel::setRomSpeedOverride,
             onSelectSpeedMode = viewModel::setSpeedToggleMode,
+            onMuteTurboAudioToggle = viewModel::setMuteTurboAudioAbove2x,
+            onAutoSaveExitToggle = viewModel::setAutoSaveOnExit,
             onSelectOrientation = viewModel::setOrientationMode,
-            onLcdGridChange = viewModel::setLcdGridIntensity,
             onAudioToggle = viewModel::setAudioEnabled,
             onHapticsToggle = viewModel::setHapticsEnabled,
             onOpacityChange = viewModel::setControlOpacity,
@@ -406,460 +482,6 @@ fun PlayerScreen(
             onImportBios = { importBiosLauncher.launch(arrayOf("application/octet-stream", "*/*")) },
             onClearBios = viewModel::clearCustomBios
         )
-    }
-}
-
-@Composable
-private fun PortraitConsoleLayout(
-    state: EmulatorUiState,
-    frameBitmap: android.graphics.Bitmap?,
-    onBack: () -> Unit,
-    onTogglePause: () -> Unit,
-    onQuickSaveSs1: () -> Unit,
-    onReset: () -> Unit,
-    onOpenSaveStates: () -> Unit,
-    onOpenCheats: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onDirectionMask: (Int) -> Unit,
-    onAChange: (Boolean) -> Unit,
-    onBChange: (Boolean) -> Unit,
-    onLChange: (Boolean) -> Unit,
-    onRChange: (Boolean) -> Unit,
-    onStartChange: (Boolean) -> Unit,
-    onSelectChange: (Boolean) -> Unit,
-    onTurboToggle: () -> Unit,
-    onTurboHold: (Boolean) -> Unit,
-    onCycleSpeed: () -> Unit
-) {
-    val prefs = state.preferences
-    val scale = prefs.controlScale
-    val speedStr = if (state.isTurboActive) {
-        val spd = prefs.fastForwardSpeed
-        if (spd % 1f == 0f) "${spd.toInt()}x" else "${spd}x"
-    } else "1x"
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Brush.verticalGradient(listOf(GraphiteBg, AnodizedSlate)))
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-        verticalArrangement = Arrangement.SpaceBetween
-    ) {
-        // Top HUD Strip
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                IconButton(
-                    onClick = onBack,
-                    modifier = Modifier.testTag("player_back_button")
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to Library")
-                }
-                Column {
-                    Text(
-                        text = state.rom?.title ?: "GBA",
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        BadgeChip("${state.fps} FPS", SurfaceCard, EmeraldLed)
-                        BadgeChip(
-                            speedStr,
-                            if (state.isTurboActive) AmberBoost else SurfaceCard,
-                            if (state.isTurboActive) Color.Black else TextSecondary
-                        )
-                    }
-                }
-            }
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onTogglePause, modifier = Modifier.testTag("player_pause_button")) {
-                    Icon(
-                        imageVector = if (state.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
-                        contentDescription = if (state.isPaused) "Resume" else "Pause"
-                    )
-                }
-                IconButton(onClick = onQuickSaveSs1, modifier = Modifier.testTag("player_quicksave_ss1")) {
-                    Icon(Icons.Default.BookmarkAdd, contentDescription = "Quick Save .ss1", tint = AmberBoost)
-                }
-                IconButton(onClick = onOpenSaveStates, modifier = Modifier.testTag("player_savestates_button")) {
-                    Icon(Icons.Default.Bookmarks, contentDescription = "Save States (.ss1-.ss9)")
-                }
-                IconButton(onClick = onOpenCheats, modifier = Modifier.testTag("player_cheats_button")) {
-                    Icon(Icons.Default.Code, contentDescription = "Cheats (.cht)")
-                }
-                IconButton(onClick = onOpenSettings, modifier = Modifier.testTag("player_settings_button")) {
-                    Icon(Icons.Default.Tune, contentDescription = "Shaders & Settings")
-                }
-            }
-        }
-
-        // GBA Anodized Screen Bezel
-        Surface(
-            color = Color(0xFF0E1016),
-            shape = RoundedCornerShape(18.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .border(1.5.dp, BorderSubtle, RoundedCornerShape(18.dp))
-        ) {
-            Column(
-                modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 8.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                GbaLcdDisplay(
-                    frameBitmap = frameBitmap,
-                    shaderPreset = prefs.shaderPreset,
-                    lcdGridIntensity = prefs.lcdGridIntensity,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(1.5f)
-                        .clip(RoundedCornerShape(8.dp))
-                        .testTag("gba_lcd_display")
-                )
-                Spacer(Modifier.height(6.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(7.dp)
-                                .clip(CircleShape)
-                                .background(if (state.isPaused) AmberBoost else EmeraldLed)
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = if (state.isPaused) "PAUSED" else "POWER",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextMuted
-                        )
-                    }
-                    Text(
-                        text = "POCKET ADVANCE • ${prefs.shaderPreset.label.uppercase()}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextMuted
-                    )
-                }
-            }
-        }
-
-        // Lower Ergonomic Handheld Control Deck
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            // L / R Shoulder Triggers
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                ShoulderBumperButton(
-                    label = "L",
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    testTag = "control_l",
-                    onPressedChange = onLChange,
-                    modifier = Modifier.width(104.dp)
-                )
-                IconButton(onClick = onReset, modifier = Modifier.testTag("player_reset_button")) {
-                    Icon(Icons.Default.RestartAlt, contentDescription = "Reset Console", tint = TextSecondary)
-                }
-                ShoulderBumperButton(
-                    label = "R",
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    testTag = "control_r",
-                    onPressedChange = onRChange,
-                    modifier = Modifier.width(104.dp)
-                )
-            }
-
-            // Primary Control Deck: D-Pad + Pizza Boy-Style Speed Toggle beside it | B & A
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    RetroDPad(
-                        size = (140 * scale).dp,
-                        opacity = prefs.controlOpacity,
-                        hapticsEnabled = prefs.hapticsEnabled,
-                        onDirectionMaskChanged = onDirectionMask
-                    )
-                    SpeedTogglePadButton(
-                        isTurboActive = state.isTurboActive,
-                        targetSpeed = prefs.fastForwardSpeed,
-                        mode = prefs.speedToggleMode,
-                        opacity = prefs.controlOpacity,
-                        hapticsEnabled = prefs.hapticsEnabled,
-                        onToggle = onTurboToggle,
-                        onHoldChange = onTurboHold,
-                        onCycleSpeed = onCycleSpeed
-                    )
-                }
-
-                // Classic GBA angled B & A buttons
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    TactileActionButton(
-                        label = "B",
-                        accentColor = CrimsonAction,
-                        size = (64 * scale).dp,
-                        opacity = prefs.controlOpacity,
-                        hapticsEnabled = prefs.hapticsEnabled,
-                        testTag = "control_b",
-                        onPressedChange = onBChange,
-                        modifier = Modifier.offset(y = 14.dp)
-                    )
-                    TactileActionButton(
-                        label = "A",
-                        accentColor = HandheldIndigo,
-                        size = (64 * scale).dp,
-                        opacity = prefs.controlOpacity,
-                        hapticsEnabled = prefs.hapticsEnabled,
-                        testTag = "control_a",
-                        onPressedChange = onAChange,
-                        modifier = Modifier.offset(y = (-10).dp)
-                    )
-                }
-            }
-
-            // Bottom SELECT / START Pills
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                PillControlButton(
-                    label = "SELECT",
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    testTag = "control_select",
-                    onPressedChange = onSelectChange
-                )
-                Spacer(Modifier.width(24.dp))
-                PillControlButton(
-                    label = "START",
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    testTag = "control_start",
-                    onPressedChange = onStartChange
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun LandscapeConsoleLayout(
-    state: EmulatorUiState,
-    frameBitmap: android.graphics.Bitmap?,
-    onBack: () -> Unit,
-    onTogglePause: () -> Unit,
-    onOpenSaveStates: () -> Unit,
-    onOpenCheats: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onDirectionMask: (Int) -> Unit,
-    onAChange: (Boolean) -> Unit,
-    onBChange: (Boolean) -> Unit,
-    onLChange: (Boolean) -> Unit,
-    onRChange: (Boolean) -> Unit,
-    onStartChange: (Boolean) -> Unit,
-    onSelectChange: (Boolean) -> Unit,
-    onTurboToggle: () -> Unit,
-    onTurboHold: (Boolean) -> Unit,
-    onCycleSpeed: () -> Unit
-) {
-    val prefs = state.preferences
-    val scale = prefs.controlScale
-    val speedStr = if (state.isTurboActive) {
-        val spd = prefs.fastForwardSpeed
-        if (spd % 1f == 0f) "${spd.toInt()}x" else "${spd}x"
-    } else "1x"
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF0D0F14))
-            .padding(horizontal = 10.dp, vertical = 6.dp)
-    ) {
-        // Centered 3:2 GBA Display
-        Box(
-            modifier = Modifier
-                .fillMaxHeight()
-                .aspectRatio(1.5f)
-                .align(Alignment.Center)
-                .clip(RoundedCornerShape(10.dp))
-                .border(1.5.dp, BorderSubtle, RoundedCornerShape(10.dp))
-        ) {
-            GbaLcdDisplay(
-                frameBitmap = frameBitmap,
-                shaderPreset = prefs.shaderPreset,
-                lcdGridIntensity = prefs.lcdGridIntensity,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .testTag("gba_lcd_display")
-            )
-
-            // Compact top telemetry overlay
-            Row(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                BadgeChip("${state.fps} FPS", Color.Black.copy(alpha = 0.65f), EmeraldLed)
-                BadgeChip(
-                    speedStr,
-                    if (state.isTurboActive) AmberBoost else Color.Black.copy(alpha = 0.65f),
-                    if (state.isTurboActive) Color.Black else TextSecondary
-                )
-            }
-        }
-
-        // Left Control Deck Overlay: L, D-Pad + Speed Toggle beside D-pad, SELECT
-        Column(
-            modifier = Modifier
-                .fillMaxHeight()
-                .align(Alignment.CenterStart),
-            verticalArrangement = Arrangement.SpaceBetween,
-            horizontalAlignment = Alignment.Start
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                IconButton(onClick = onBack, modifier = Modifier.testTag("player_back_button")) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextSecondary)
-                }
-                ShoulderBumperButton(
-                    label = "L",
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    testTag = "control_l",
-                    onPressedChange = onLChange,
-                    modifier = Modifier.width(86.dp)
-                )
-            }
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                RetroDPad(
-                    size = (132 * scale).dp,
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    onDirectionMaskChanged = onDirectionMask
-                )
-                SpeedTogglePadButton(
-                    isTurboActive = state.isTurboActive,
-                    targetSpeed = prefs.fastForwardSpeed,
-                    mode = prefs.speedToggleMode,
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    onToggle = onTurboToggle,
-                    onHoldChange = onTurboHold,
-                    onCycleSpeed = onCycleSpeed
-                )
-            }
-
-            PillControlButton(
-                label = "SELECT",
-                opacity = prefs.controlOpacity,
-                hapticsEnabled = prefs.hapticsEnabled,
-                testTag = "control_select",
-                onPressedChange = onSelectChange
-            )
-        }
-
-        // Right Control Deck Overlay: HUD Actions + R, B & A, START
-        Column(
-            modifier = Modifier
-                .fillMaxHeight()
-                .align(Alignment.CenterEnd),
-            verticalArrangement = Arrangement.SpaceBetween,
-            horizontalAlignment = Alignment.End
-        ) {
-            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onTogglePause, modifier = Modifier.testTag("player_pause_button")) {
-                        Icon(
-                            if (state.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
-                            contentDescription = "Pause/Resume",
-                            tint = TextSecondary
-                        )
-                    }
-                    IconButton(onClick = onOpenSaveStates, modifier = Modifier.testTag("player_savestates_button")) {
-                        Icon(Icons.Default.Bookmarks, contentDescription = "Save States", tint = TextSecondary)
-                    }
-                    IconButton(onClick = onOpenCheats, modifier = Modifier.testTag("player_cheats_button")) {
-                        Icon(Icons.Default.Code, contentDescription = "Cheats", tint = TextSecondary)
-                    }
-                    IconButton(onClick = onOpenSettings, modifier = Modifier.testTag("player_settings_button")) {
-                        Icon(Icons.Default.Tune, contentDescription = "Settings", tint = TextSecondary)
-                    }
-                }
-                ShoulderBumperButton(
-                    label = "R",
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    testTag = "control_r",
-                    onPressedChange = onRChange,
-                    modifier = Modifier.width(86.dp)
-                )
-            }
-
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                TactileActionButton(
-                    label = "B",
-                    accentColor = CrimsonAction,
-                    size = (62 * scale).dp,
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    testTag = "control_b",
-                    onPressedChange = onBChange,
-                    modifier = Modifier.offset(y = 14.dp)
-                )
-                TactileActionButton(
-                    label = "A",
-                    accentColor = HandheldIndigo,
-                    size = (62 * scale).dp,
-                    opacity = prefs.controlOpacity,
-                    hapticsEnabled = prefs.hapticsEnabled,
-                    testTag = "control_a",
-                    onPressedChange = onAChange,
-                    modifier = Modifier.offset(y = (-10).dp)
-                )
-            }
-
-            PillControlButton(
-                label = "START",
-                opacity = prefs.controlOpacity,
-                hapticsEnabled = prefs.hapticsEnabled,
-                testTag = "control_start",
-                onPressedChange = onStartChange
-            )
-        }
     }
 }
 

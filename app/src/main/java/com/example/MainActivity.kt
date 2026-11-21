@@ -37,19 +37,27 @@ class MainActivity : ComponentActivity() {
                     composable(ROUTE_LIBRARY) {
                         LibraryScreen(
                             viewModel = libraryViewModel,
-                            onOpenPlayer = { romId ->
-                                navController.navigate("player/$romId")
+                            onOpenPlayer = { romId, loadSlot ->
+                                navController.navigate("player/$romId?loadSlot=$loadSlot")
                             }
                         )
                     }
                     composable(
                         route = ROUTE_PLAYER,
-                        arguments = listOf(navArgument("romId") { type = NavType.LongType })
+                        arguments = listOf(
+                            navArgument("romId") { type = NavType.LongType },
+                            navArgument("loadSlot") {
+                                type = NavType.IntType
+                                defaultValue = -1
+                            }
+                        )
                     ) { backStackEntry ->
                         val romId = backStackEntry.arguments?.getLong("romId") ?: return@composable
+                        val loadSlot = backStackEntry.arguments?.getInt("loadSlot") ?: -1
                         val emulatorViewModel: EmulatorViewModel = viewModel()
                         PlayerScreen(
                             romId = romId,
+                            initialLoadSlot = loadSlot,
                             viewModel = emulatorViewModel,
                             onBack = { navController.popBackStack() }
                         )
@@ -61,6 +69,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val ROUTE_LIBRARY = "library"
-        const val ROUTE_PLAYER = "player/{romId}"
+        const val ROUTE_PLAYER = "player/{romId}?loadSlot={loadSlot}"
     }
 }

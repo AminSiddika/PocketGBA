@@ -8,6 +8,59 @@ object CheatDecoder {
         0x09F4FBBD, 0x9681884A.toInt(), 0x352027E9, 0xF3DEE5A7.toInt()
     )
 
+    fun normalizeCodeKey(rawCode: String): String =
+        rawCode.uppercase().replace(Regex("[^0-9A-F]"), "")
+
+    fun inspectPreview(rawCode: String, format: CheatFormat): CheatPreviewResult {
+        val lines = rawCode
+            .replace("+", "\n")
+            .lines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") && !it.startsWith("//") }
+
+        if (lines.isEmpty()) {
+            return CheatPreviewResult(
+                isValid = false,
+                detectedFormat = format,
+                summary = "Enter one or more 8+4 or 8+8 hex cheat lines.",
+                lineCount = 0,
+                invalidLines = emptyList()
+            )
+        }
+
+        val invalid = lines.filter { parseHexPair(it) == null }
+        val compiled = compile(0L, "Preview", rawCode, format)
+        val firstOp = compiled.ops.firstOrNull()
+        val opDesc = when (firstOp) {
+            is CheatOp.Write8 -> "8-bit Write @ 0x%08X = 0x%02X".format(firstOp.addr, firstOp.value)
+            is CheatOp.Write16 -> "16-bit Write @ 0x%08X = 0x%04X".format(firstOp.addr, firstOp.value)
+            is CheatOp.Write32 -> "32-bit Write @ 0x%08X = 0x%08X".format(firstOp.addr, firstOp.value)
+            is CheatOp.RomPatch16 -> "ROM Patch @ 0x%08X = 0x%04X".format(firstOp.addr, firstOp.value)
+            is CheatOp.Slide16 -> "Slide ${firstOp.count}×16-bit @ 0x%08X".format(firstOp.addr)
+            is CheatOp.CondEqual16 -> "If [0x%08X] == 0x%04X".format(firstOp.addr, firstOp.value)
+            is CheatOp.CondNotEqual16 -> "If [0x%08X] != 0x%04X".format(firstOp.addr, firstOp.value)
+            else -> "${compiled.ops.size} op(s)"
+        }
+
+        return if (invalid.isNotEmpty()) {
+            CheatPreviewResult(
+                isValid = false,
+                detectedFormat = compiled.format,
+                summary = "Invalid hex on line: ${invalid.first()}",
+                lineCount = lines.size,
+                invalidLines = invalid
+            )
+        } else {
+            CheatPreviewResult(
+                isValid = compiled.ops.isNotEmpty(),
+                detectedFormat = compiled.format,
+                summary = "${compiled.format.label} • $opDesc (${compiled.ops.size} op${if (compiled.ops.size == 1) "" else "s"})",
+                lineCount = lines.size,
+                invalidLines = emptyList()
+            )
+        }
+    }
+
     fun compile(id: Long, name: String, rawCode: String, format: CheatFormat): CompiledCheat {
         val lines = rawCode
             .replace("+", "\n")
@@ -36,9 +89,8 @@ object CheatDecoder {
                         0x3 -> ops.add(CheatOp.Write8(realAddr, value and 0xFF))
                         0x8 -> ops.add(CheatOp.Write16(realAddr, value and 0xFFFF))
                         0x6 -> ops.add(CheatOp.Write16(realAddr, value and 0xFFFF))
-                        0x2 -> ops.add(CheatOp.Write16(realAddr, value and 0xFFFF)) // OR helper
+                        0x2 -> ops.add(CheatOp.Write16(realAddr, value and 0xFFFF))
                         0x4 -> {
-                            // Slide code: next line holds count / step
                             val next = if (i + 1 < lines.size) parseHexPair(lines[i + 1]) else null
                             if (next != null) {
                                 val valStep = (next.first ushr 16) and 0xFFFF
@@ -181,13 +233,11 @@ object CheatDecoder {
     }
 
     private fun decodeCodeBreakerPair(addr: Int, value: Int): Pair<Int, Int> {
-        // Decrypted CB codes already have valid GBA region nibbles (0x02/0x03/0x08/0x32/0x33/0x82/0x83/0xD0)
         val topByte = (addr ushr 24) and 0xFF
         val lowNib = topByte and 0x0F
         if (lowNib == 2 || lowNib == 3 || lowNib == 8 || (topByte ushr 4) in listOf(3, 8, 0xD, 7, 4, 6, 0xA)) {
             return addr to value
         }
-        // Standard TEA-style CB seed decode fallback for encrypted 8+4 codes
         var v0 = addr
         var v1 = value
         var sum = 0xC6EF3720.toInt()

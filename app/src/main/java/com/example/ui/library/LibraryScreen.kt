@@ -30,10 +30,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Gamepad
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SportsEsports
@@ -81,6 +84,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.data.db.RomEntity
+import com.example.data.db.ShaderProfileEntity
+import com.example.ui.player.CheatManagerSheet
+import com.example.ui.player.ShaderManagerSheet
 import com.example.ui.theme.AmberBoost
 import com.example.ui.theme.AnodizedSlate
 import com.example.ui.theme.BorderSubtle
@@ -97,11 +103,13 @@ import com.example.ui.theme.TextSecondary
 @Composable
 fun LibraryScreen(
     viewModel: LibraryViewModel,
-    onOpenPlayer: (Long) -> Unit
+    onOpenPlayer: (romId: Long, loadSlot: Int) -> Unit
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     var romPendingDelete by remember { mutableStateOf<RomEntity?>(null) }
+    var showShadersSheet by remember { mutableStateOf(false) }
+    var pendingExportShader by remember { mutableStateOf<ShaderProfileEntity?>(null) }
 
     LaunchedEffect(Unit) {
         viewModel.refreshSlotBadges()
@@ -120,9 +128,37 @@ fun LibraryScreen(
     ) { uri: Uri? ->
         if (uri != null) {
             viewModel.importRom(uri) { romId ->
-                onOpenPlayer(romId)
+                onOpenPlayer(romId, -1)
             }
         }
+    }
+
+    val importCheatLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) viewModel.importCheatFile(uri)
+    }
+
+    val exportCheatLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri: Uri? ->
+        if (uri != null) viewModel.exportCheats(uri)
+    }
+
+    val importShaderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) viewModel.importShaderFile(uri)
+    }
+
+    val exportShaderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? ->
+        val profile = pendingExportShader
+        if (uri != null && profile != null) {
+            viewModel.exportShaderProfile(profile, uri)
+        }
+        pendingExportShader = null
     }
 
     Scaffold(
@@ -158,8 +194,18 @@ fun LibraryScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = { showShadersSheet = true },
+                        modifier = Modifier.testTag("toolbar_shaders_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = "Open Shaders Manager",
+                            tint = LuminousViolet
+                        )
+                    }
                     OutlinedButton(
-                        onClick = { viewModel.launchBuiltInDemo(onOpenPlayer) },
+                        onClick = { viewModel.launchBuiltInDemo { id -> onOpenPlayer(id, -1) } },
                         modifier = Modifier
                             .padding(end = 12.dp)
                             .testTag("toolbar_demo_button"),
@@ -242,7 +288,7 @@ fun LibraryScreen(
                         onImportClick = {
                             romPickerLauncher.launch(arrayOf("application/octet-stream", "application/zip", "*/*"))
                         },
-                        onDemoClick = { viewModel.launchBuiltInDemo(onOpenPlayer) }
+                        onDemoClick = { viewModel.launchBuiltInDemo { id -> onOpenPlayer(id, -1) } }
                     )
                 } else {
                     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -256,7 +302,16 @@ fun LibraryScreen(
                             items(state.roms, key = { it.rom.id }) { card ->
                                 RomCartridgeCard(
                                     card = card,
-                                    onPlay = { onOpenPlayer(card.rom.id) },
+                                    onPlay = { onOpenPlayer(card.rom.id, -1) },
+                                    onResumeAuto = {
+                                        val resumeSlot = when {
+                                            card.hasSs0 -> 0
+                                            card.hasSs1 -> 1
+                                            else -> 2
+                                        }
+                                        onOpenPlayer(card.rom.id, resumeSlot)
+                                    },
+                                    onOpenCheats = { viewModel.openCheatManager(card.rom) },
                                     onDelete = { romPendingDelete = card.rom }
                                 )
                             }
@@ -265,6 +320,50 @@ fun LibraryScreen(
                 }
             }
         }
+    }
+
+    if (showShadersSheet) {
+        ShaderManagerSheet(
+            previewBitmap = null,
+            profiles = state.shaderProfiles,
+            activeGlobalProfileId = state.activeShaderProfileId,
+            currentRom = null,
+            onDismiss = { showShadersSheet = false },
+            onSelectGlobalProfile = viewModel::selectGlobalShaderProfile,
+            onSaveProfile = viewModel::saveShaderProfile,
+            onDeleteCustomProfile = viewModel::deleteCustomShaderProfile,
+            onImportShaderFile = {
+                importShaderLauncher.launch(arrayOf("text/plain", "application/json", "application/octet-stream", "*/*"))
+            },
+            onExportProfile = { profile ->
+                pendingExportShader = profile
+                exportShaderLauncher.launch("${profile.name.replace(" ", "_").lowercase()}.json")
+            }
+        )
+    }
+
+    state.managingCheatsForRom?.let { targetRom ->
+        CheatManagerSheet(
+            romTitle = targetRom.title,
+            cheats = state.managedRomCheats,
+            masterEnabled = state.masterCheatsEnabled,
+            zipCandidates = state.zipCandidates,
+            onDismiss = viewModel::closeCheatManager,
+            onToggleMaster = viewModel::setMasterCheatsEnabled,
+            onToggleCheat = viewModel::toggleCheat,
+            onToggleGroup = viewModel::toggleCheatGroup,
+            onSetAllEnabled = viewModel::setAllCheatsEnabled,
+            onSaveCheat = viewModel::saveCheat,
+            onDeleteCheat = viewModel::deleteCheat,
+            onImportCheatFile = {
+                importCheatLauncher.launch(arrayOf("text/plain", "application/zip", "application/octet-stream", "*/*"))
+            },
+            onExportCheatFile = {
+                exportCheatLauncher.launch("${targetRom.baseName}.cht")
+            },
+            onPickZipCandidate = viewModel::importZipCandidate,
+            onDismissZipCandidates = viewModel::dismissZipCandidates
+        )
     }
 
     romPendingDelete?.let { rom ->
@@ -376,9 +475,13 @@ private fun EmptyShelfView(
 private fun RomCartridgeCard(
     card: RomLibraryCard,
     onPlay: () -> Unit,
+    onResumeAuto: () -> Unit,
+    onOpenCheats: () -> Unit,
     onDelete: () -> Unit
 ) {
     val rom = card.rom
+    val hasResumeSlot = card.hasSs0 || card.hasSs1 || card.hasSs2
+
     Card(
         shape = RoundedCornerShape(18.dp),
         colors = CardDefaults.cardColors(containerColor = SurfaceCard),
@@ -445,9 +548,9 @@ private fun RomCartridgeCard(
                 }
             }
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(10.dp))
 
-            // Play stats + .ss1 / .ss2 slot status bar
+            // Play stats + .ss0 / .ss1 / .ss2 slot status bar
             Surface(
                 color = AnodizedSlate,
                 shape = RoundedCornerShape(12.dp),
@@ -482,14 +585,77 @@ private fun RomCartridgeCard(
                         )
                         Spacer(Modifier.width(4.dp))
                         Text(
-                            text = "${card.saveSlotCount} slots (${rom.totalSavesCreated} saves)",
+                            text = "${card.saveSlotCount} slots",
                             style = MaterialTheme.typography.labelMedium,
                             color = TextSecondary
                         )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (card.hasSs0) BadgeChip("SS0", EmeraldLed.copy(alpha = 0.2f), EmeraldLed)
                         if (card.hasSs1) BadgeChip("SS1", AmberBoost.copy(alpha = 0.2f), AmberBoost)
                         if (card.hasSs2) BadgeChip("SS2", LuminousViolet.copy(alpha = 0.2f), LuminousViolet)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            // Shelf quick actions: Manage Cheats (.cht) & Resume State
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onOpenCheats,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(40.dp)
+                        .testTag("card_cheats_button_${rom.id}"),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp)
+                ) {
+                    Icon(Icons.Default.Code, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = if (card.totalCheats > 0) "Cheats (${card.enabledCheats}/${card.totalCheats})" else "Cheats",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+
+                if (hasResumeSlot) {
+                    Button(
+                        onClick = onResumeAuto,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(40.dp)
+                            .testTag("card_resume_button_${rom.id}"),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = EmeraldLed.copy(alpha = 0.20f),
+                            contentColor = EmeraldLed
+                        )
+                    ) {
+                        Icon(Icons.Default.Restore, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = if (card.hasSs0) "Resume SS0" else "Resume SS1",
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                } else {
+                    Button(
+                        onClick = onPlay,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(40.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = HandheldIndigo)
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Play", style = MaterialTheme.typography.labelMedium)
                     }
                 }
             }

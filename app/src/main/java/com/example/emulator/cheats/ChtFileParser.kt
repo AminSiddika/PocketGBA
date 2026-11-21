@@ -12,29 +12,31 @@ data class ZipCheatCandidate(
 
 object ChtFileParser {
 
-    fun parse(text: String, fallbackName: String = "Imported Cheat"): List<ParsedChtEntry> {
+    fun parse(
+        text: String,
+        fallbackName: String = "Imported Cheat",
+        defaultGroup: String = "Imported Pack"
+    ): List<ParsedChtEntry> {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return emptyList()
 
-        // 1. Libretro / RetroArch .cht format: cheats = N, cheat0_desc = "...", cheat0_code = "...", cheat0_enable = ...
         if (trimmed.contains("cheat0_code") || trimmed.contains("cheats =")) {
-            return parseLibretroCht(trimmed)
+            return parseLibretroCht(trimmed, defaultGroup)
         }
 
-        // 2. Pizza Boy / VBA INI style: [Section] or Key=Value or Name\nCode
         if (trimmed.lines().any { it.trim().startsWith("[") && it.trim().endsWith("]") }) {
-            return parseIniCht(trimmed)
+            return parseIniCht(trimmed, defaultGroup)
         }
 
-        // 3. mGBA / Plain-text cheat pack (# Title\nCODE or Title: CODE)
-        return parsePlainTextCheats(trimmed, fallbackName)
+        return parsePlainTextCheats(trimmed, fallbackName, defaultGroup)
     }
 
-    private fun parseLibretroCht(text: String): List<ParsedChtEntry> {
+    private fun parseLibretroCht(text: String, defaultGroup: String): List<ParsedChtEntry> {
         val descMap = HashMap<Int, String>()
         val codeMap = HashMap<Int, String>()
         val enableMap = HashMap<Int, Boolean>()
         val typeMap = HashMap<Int, CheatFormat>()
+        val groupMap = HashMap<Int, String>()
 
         val regex = Regex("""^cheat(\d+)_(\w+)\s*=\s*(.+)$""")
         for (rawLine in text.lines()) {
@@ -48,6 +50,7 @@ object ChtFileParser {
                 "desc" -> descMap[idx] = rawVal.ifBlank { "Cheat #${idx + 1}" }
                 "code" -> codeMap[idx] = rawVal.replace("+", "\n")
                 "enable" -> enableMap[idx] = rawVal.equals("true", ignoreCase = true) || rawVal == "1"
+                "group", "category" -> if (rawVal.isNotBlank()) groupMap[idx] = rawVal
                 "cheat_type", "type" -> typeMap[idx] = when {
                     rawVal.contains("cb", true) || rawVal.contains("codebreaker", true) -> CheatFormat.CODEBREAKER
                     rawVal.contains("ar", true) || rawVal.contains("v3", true) -> CheatFormat.ACTION_REPLAY_V3
@@ -65,17 +68,19 @@ object ChtFileParser {
                 code = code,
                 format = typeMap[idx] ?: CheatFormat.AUTO,
                 enabled = enableMap[idx] ?: false,
-                sourceFormat = "Libretro/PizzaBoy .cht"
+                sourceFormat = "Libretro/PizzaBoy .cht",
+                groupName = groupMap[idx] ?: defaultGroup
             )
         }
     }
 
-    private fun parseIniCht(text: String): List<ParsedChtEntry> {
+    private fun parseIniCht(text: String, defaultGroup: String): List<ParsedChtEntry> {
         val result = ArrayList<ParsedChtEntry>()
         var currentSection = ""
         val currentCodes = ArrayList<String>()
         var currentFormat = CheatFormat.AUTO
         var currentEnabled = false
+        var currentGroup = defaultGroup
 
         fun flush() {
             if (currentCodes.isNotEmpty()) {
@@ -85,7 +90,8 @@ object ChtFileParser {
                         code = currentCodes.joinToString("\n"),
                         format = currentFormat,
                         enabled = currentEnabled,
-                        sourceFormat = "Pizza Boy / INI .cht"
+                        sourceFormat = "Pizza Boy / INI .cht",
+                        groupName = currentGroup
                     )
                 )
                 currentCodes.clear()
@@ -108,6 +114,9 @@ object ChtFileParser {
                     k.equals("enabled", true) || k.equals("enable", true) -> {
                         currentEnabled = v == "1" || v.equals("true", true)
                     }
+                    k.equals("group", true) || k.equals("category", true) -> {
+                        if (v.isNotBlank()) currentGroup = v
+                    }
                     k.equals("format", true) || k.equals("type", true) -> {
                         currentFormat = when {
                             v.contains("cb", true) || v.contains("breaker", true) -> CheatFormat.CODEBREAKER
@@ -120,14 +129,14 @@ object ChtFileParser {
                         currentCodes.addAll(v.split("+", ";", ",").map { it.trim() }.filter { it.isNotEmpty() })
                     }
                     else -> {
-                        // Key=HexCode format (common in VBA/Pizza Boy text packs)
                         result.add(
                             ParsedChtEntry(
                                 name = k,
                                 code = v.replace("+", "\n").replace(";", "\n"),
                                 format = CheatFormat.AUTO,
                                 enabled = false,
-                                sourceFormat = "Pizza Boy / VBA .cht"
+                                sourceFormat = "Pizza Boy / VBA .cht",
+                                groupName = currentSection.ifBlank { defaultGroup }
                             )
                         )
                     }
@@ -140,7 +149,11 @@ object ChtFileParser {
         return result
     }
 
-    private fun parsePlainTextCheats(text: String, fallbackName: String): List<ParsedChtEntry> {
+    private fun parsePlainTextCheats(
+        text: String,
+        fallbackName: String,
+        defaultGroup: String
+    ): List<ParsedChtEntry> {
         val result = ArrayList<ParsedChtEntry>()
         var pendingTitle = fallbackName
         val pendingLines = ArrayList<String>()
@@ -154,7 +167,8 @@ object ChtFileParser {
                         code = pendingLines.joinToString("\n"),
                         format = CheatFormat.AUTO,
                         enabled = false,
-                        sourceFormat = "mGBA / Plain .cht"
+                        sourceFormat = "mGBA / Plain .cht",
+                        groupName = defaultGroup
                     )
                 )
                 pendingLines.clear()
@@ -182,7 +196,8 @@ object ChtFileParser {
                         code = code,
                         format = CheatFormat.AUTO,
                         enabled = false,
-                        sourceFormat = "Plain Cheat List"
+                        sourceFormat = "Plain Cheat List",
+                        groupName = defaultGroup
                     )
                 )
             } else {
@@ -218,7 +233,8 @@ object ChtFileParser {
                     for (token in titleTokens) {
                         if (lowerName.contains(token)) score += 10
                     }
-                    val count = parse(content, name.substringAfterLast('/').substringBeforeLast('.')).size
+                    val cleanBase = name.substringAfterLast('/').substringBeforeLast('.')
+                    val count = parse(content, cleanBase, cleanBase).size
                     if (count > 0) {
                         candidates.add(
                             ZipCheatCandidate(
@@ -252,6 +268,9 @@ object ChtFileParser {
             sb.appendLine("cheat${idx}_desc = \"${entry.name.replace("\"", "'")}\"")
             sb.appendLine("cheat${idx}_code = \"$joinedCode\"")
             sb.appendLine("cheat${idx}_enable = ${entry.enabled}")
+            if (entry.groupName.isNotBlank()) {
+                sb.appendLine("cheat${idx}_group = \"${entry.groupName.replace("\"", "'")}\"")
+            }
             sb.appendLine()
         }
         return sb.toString()

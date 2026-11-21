@@ -1,7 +1,9 @@
 package com.example.ui.player
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -14,14 +16,21 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -31,28 +40,35 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.db.CheatEntity
+import com.example.emulator.cheats.CheatDecoder
 import com.example.emulator.cheats.CheatFormat
 import com.example.emulator.cheats.ZipCheatCandidate
 import com.example.ui.library.BadgeChip
@@ -78,8 +94,9 @@ fun CheatManagerSheet(
     onDismiss: () -> Unit,
     onToggleMaster: (Boolean) -> Unit,
     onToggleCheat: (CheatEntity) -> Unit,
+    onToggleGroup: (groupName: String, enabled: Boolean) -> Unit,
     onSetAllEnabled: (Boolean) -> Unit,
-    onSaveCheat: (id: Long, name: String, code: String, format: CheatFormat) -> Unit,
+    onSaveCheat: (id: Long, name: String, code: String, format: CheatFormat, groupName: String) -> Unit,
     onDeleteCheat: (Long) -> Unit,
     onImportCheatFile: () -> Unit,
     onExportCheatFile: () -> Unit,
@@ -89,6 +106,26 @@ fun CheatManagerSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var editingCheat by remember { mutableStateOf<CheatEntity?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var selectedFormatFilter by remember { mutableStateOf<CheatFormat?>(null) }
+    val collapsedGroups = remember { mutableStateMapOf<String, Boolean>() }
+
+    val filteredCheats = remember(cheats, searchQuery, selectedFormatFilter) {
+        val q = searchQuery.trim().lowercase()
+        cheats.filter { cheat ->
+            val fmtMatches = selectedFormatFilter == null || cheat.formatName == selectedFormatFilter?.name
+            val qMatches = q.isEmpty() ||
+                cheat.name.lowercase().contains(q) ||
+                cheat.code.lowercase().contains(q) ||
+                cheat.groupName.lowercase().contains(q)
+            fmtMatches && qMatches
+        }
+    }
+
+    val groupedCheats = remember(filteredCheats) {
+        filteredCheats.groupBy { it.groupName.ifBlank { "Manual" } }
+            .toSortedMap(String.CASE_INSENSITIVE_ORDER)
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -106,9 +143,9 @@ fun CheatManagerSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("CHEAT MANAGER (.CHT / CBA / GS / AR)", style = MaterialTheme.typography.titleLarge)
+                    Text("CHEAT CODE MANAGER", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        text = "$romTitle • Pizza Boy, Libretro & mGBA compatible",
+                        text = "$romTitle • .cht / .zip / CBA / GS / AR",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary,
                         maxLines = 1,
@@ -160,15 +197,65 @@ fun CheatManagerSheet(
             }
 
             if (cheats.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Search cheat name, hex code, or pack...") },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = SurfaceCard,
+                        unfocusedContainerColor = SurfaceCard,
+                        focusedBorderColor = LuminousViolet,
+                        unfocusedBorderColor = BorderSubtle
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("cheat_search_input")
+                )
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
                         .padding(top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    FilterChip(
+                        selected = selectedFormatFilter == null,
+                        onClick = { selectedFormatFilter = null },
+                        label = { Text("All (${cheats.size})", style = MaterialTheme.typography.labelSmall) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = HandheldIndigo,
+                            selectedLabelColor = Color.White
+                        )
+                    )
+                    CheatFormat.entries.filter { it != CheatFormat.AUTO }.forEach { fmt ->
+                        FilterChip(
+                            selected = selectedFormatFilter == fmt,
+                            onClick = {
+                                selectedFormatFilter = if (selectedFormatFilter == fmt) null else fmt
+                            },
+                            label = { Text(fmt.label.substringBefore(" "), style = MaterialTheme.typography.labelSmall) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = HandheldIndigo,
+                                selectedLabelColor = Color.White
+                            )
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 2.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "${cheats.count { it.enabled }}/${cheats.size} active",
+                        text = "${cheats.count { it.enabled }}/${cheats.size} active across ${groupedCheats.size} pack(s)",
                         style = MaterialTheme.typography.labelSmall,
                         color = if (masterEnabled) EmeraldLed else AmberBoost
                     )
@@ -179,7 +266,7 @@ fun CheatManagerSheet(
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
 
             if (cheats.isEmpty()) {
                 Card(
@@ -200,66 +287,150 @@ fun CheatManagerSheet(
                         )
                     }
                 }
+            } else if (filteredCheats.isEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 28.dp)
+                ) {
+                    Text(
+                        text = "No cheats match \"$searchQuery\".",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextSecondary,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                }
             } else {
                 LazyColumn(
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                     contentPadding = PaddingValues(bottom = 28.dp)
                 ) {
-                    items(cheats, key = { it.id }) { cheat ->
-                        val fmt = runCatching { CheatFormat.valueOf(cheat.formatName) }.getOrDefault(CheatFormat.AUTO)
-                        Card(
-                            shape = RoundedCornerShape(14.dp),
-                            colors = CardDefaults.cardColors(containerColor = SurfaceCard),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .border(
-                                    1.dp,
-                                    if (cheat.enabled) HandheldIndigo.copy(alpha = 0.6f) else BorderSubtle,
-                                    RoundedCornerShape(14.dp)
-                                )
-                        ) {
-                            Row(
+                    groupedCheats.forEach { (groupName, groupItems) ->
+                        val isCollapsed = collapsedGroups[groupName] == true
+                        val groupAllEnabled = groupItems.isNotEmpty() && groupItems.all { it.enabled }
+                        val groupEnabledCount = groupItems.count { it.enabled }
+
+                        item(key = "header_$groupName") {
+                            Surface(
+                                color = SurfaceElevated,
+                                shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                    .border(1.dp, BorderSubtle, RoundedCornerShape(12.dp))
+                                    .clickable { collapsedGroups[groupName] = !isCollapsed }
+                                    .testTag("cheat_group_header_$groupName")
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = cheat.name,
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.SemiBold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Spacer(Modifier.height(4.dp))
-                                    Text(
-                                        text = cheat.code.lines().take(2).joinToString(" + "),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = LuminousViolet,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Spacer(Modifier.height(4.dp))
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        BadgeChip(fmt.label, SurfaceElevated, TextSecondary)
-                                        BadgeChip(cheat.sourceFormat, SurfaceElevated, TextMuted)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Folder,
+                                            contentDescription = null,
+                                            tint = AmberBoost,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Column {
+                                            Text(
+                                                text = groupName,
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                text = "$groupEnabledCount/${groupItems.size} enabled",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (groupEnabledCount > 0) EmeraldLed else TextSecondary
+                                            )
+                                        }
+                                    }
+
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Switch(
+                                            checked = groupAllEnabled,
+                                            onCheckedChange = { checked -> onToggleGroup(groupName, checked) },
+                                            modifier = Modifier.testTag("cheat_group_switch_$groupName")
+                                        )
+                                        Icon(
+                                            imageVector = if (isCollapsed) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
+                                            contentDescription = if (isCollapsed) "Expand group" else "Collapse group",
+                                            tint = TextSecondary
+                                        )
                                     }
                                 }
-                                IconButton(onClick = {
-                                    editingCheat = cheat
-                                    showAddDialog = true
-                                }) {
-                                    Icon(Icons.Default.Edit, contentDescription = "Edit cheat", tint = TextSecondary)
+                            }
+                        }
+
+                        if (!isCollapsed) {
+                            items(groupItems, key = { it.id }) { cheat ->
+                                val fmt = runCatching { CheatFormat.valueOf(cheat.formatName) }.getOrDefault(CheatFormat.AUTO)
+                                Card(
+                                    shape = RoundedCornerShape(14.dp),
+                                    colors = CardDefaults.cardColors(containerColor = SurfaceCard),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 6.dp)
+                                        .border(
+                                            1.dp,
+                                            if (cheat.enabled) HandheldIndigo.copy(alpha = 0.6f) else BorderSubtle,
+                                            RoundedCornerShape(14.dp)
+                                        )
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = cheat.name,
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                text = cheat.code.lines().take(2).joinToString(" + "),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = LuminousViolet,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Spacer(Modifier.height(4.dp))
+                                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                BadgeChip(fmt.label, SurfaceElevated, TextSecondary)
+                                                BadgeChip(cheat.sourceFormat, SurfaceElevated, TextMuted)
+                                            }
+                                        }
+                                        IconButton(onClick = {
+                                            editingCheat = cheat
+                                            showAddDialog = true
+                                        }) {
+                                            Icon(Icons.Default.Edit, contentDescription = "Edit cheat", tint = TextSecondary)
+                                        }
+                                        IconButton(onClick = { onDeleteCheat(cheat.id) }) {
+                                            Icon(Icons.Default.DeleteOutline, contentDescription = "Delete cheat", tint = CrimsonAction)
+                                        }
+                                        Switch(
+                                            checked = cheat.enabled,
+                                            onCheckedChange = { onToggleCheat(cheat) },
+                                            modifier = Modifier.testTag("cheat_switch_${cheat.id}")
+                                        )
+                                    }
                                 }
-                                IconButton(onClick = { onDeleteCheat(cheat.id) }) {
-                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Delete cheat", tint = CrimsonAction)
-                                }
-                                Switch(
-                                    checked = cheat.enabled,
-                                    onCheckedChange = { onToggleCheat(cheat) },
-                                    modifier = Modifier.testTag("cheat_switch_${cheat.id}")
-                                )
                             }
                         }
                     }
@@ -272,8 +443,8 @@ fun CheatManagerSheet(
         AddEditCheatDialog(
             initial = editingCheat,
             onDismiss = { showAddDialog = false },
-            onConfirm = { name, code, format ->
-                onSaveCheat(editingCheat?.id ?: 0L, name, code, format)
+            onConfirm = { name, code, format, groupName ->
+                onSaveCheat(editingCheat?.id ?: 0L, name, code, format, groupName)
                 showAddDialog = false
             }
         )
@@ -342,9 +513,10 @@ fun CheatManagerSheet(
 private fun AddEditCheatDialog(
     initial: CheatEntity?,
     onDismiss: () -> Unit,
-    onConfirm: (String, String, CheatFormat) -> Unit
+    onConfirm: (String, String, CheatFormat, String) -> Unit
 ) {
     var name by remember { mutableStateOf(initial?.name ?: "") }
+    var groupName by remember { mutableStateOf(initial?.groupName ?: "Manual") }
     var code by remember { mutableStateOf(initial?.code ?: "") }
     var format by remember {
         mutableStateOf(
@@ -353,6 +525,8 @@ private fun AddEditCheatDialog(
         )
     }
     var dropdownExpanded by remember { mutableStateOf(false) }
+
+    val preview = remember(code, format) { CheatDecoder.inspectPreview(code, format) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -367,6 +541,15 @@ private fun AddEditCheatDialog(
                     onValueChange = { name = it },
                     label = { Text("Cheat Name") },
                     placeholder = { Text("e.g. Infinite Master Balls") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                OutlinedTextField(
+                    value = groupName,
+                    onValueChange = { groupName = it },
+                    label = { Text("Group / Pack Folder") },
+                    placeholder = { Text("e.g. Favorites, Items, Manual") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -411,12 +594,45 @@ private fun AddEditCheatDialog(
                     textStyle = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                // Live Hex Syntax & Decoded Memory Target Preview
+                AnimatedVisibility(visible = code.isNotBlank()) {
+                    Surface(
+                        color = AnodizedSlate,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(
+                                1.dp,
+                                if (preview.isValid) EmeraldLed.copy(alpha = 0.6f) else CrimsonAction.copy(alpha = 0.7f),
+                                RoundedCornerShape(10.dp)
+                            )
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (preview.isValid) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+                                contentDescription = null,
+                                tint = if (preview.isValid) EmeraldLed else CrimsonAction,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = preview.summary,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (preview.isValid) EmeraldLed else CrimsonAction
+                            )
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
             Button(
-                onClick = { onConfirm(name, code, format) },
-                enabled = name.isNotBlank() && code.isNotBlank()
+                onClick = { onConfirm(name, code, format, groupName.ifBlank { "Manual" }) },
+                enabled = name.isNotBlank() && code.isNotBlank() && preview.isValid
             ) {
                 Text("Save Cheat")
             }

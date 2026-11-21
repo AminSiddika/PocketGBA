@@ -1,7 +1,6 @@
 package com.example.ui.player
 
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -12,14 +11,21 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -36,8 +42,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.data.EmulatorPreferences
+import com.example.data.db.RomEntity
+import com.example.data.db.ShaderProfileEntity
 import com.example.emulator.OrientationMode
-import com.example.emulator.ShaderPreset
 import com.example.emulator.SpeedToggleMode
 import com.example.ui.theme.AmberBoost
 import com.example.ui.theme.AnodizedSlate
@@ -46,17 +53,22 @@ import com.example.ui.theme.HandheldIndigo
 import com.example.ui.theme.LuminousViolet
 import com.example.ui.theme.SurfaceCard
 import com.example.ui.theme.TextSecondary
+import kotlin.math.abs
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ShaderAndSettingsSheet(
     preferences: EmulatorPreferences,
+    activeShaderProfile: ShaderProfileEntity,
+    currentRom: RomEntity?,
     onDismiss: () -> Unit,
-    onSelectShader: (ShaderPreset) -> Unit,
+    onOpenShadersManager: () -> Unit,
     onSelectSpeed: (Float) -> Unit,
+    onSetRomSpeedOverride: (Float?) -> Unit,
     onSelectSpeedMode: (SpeedToggleMode) -> Unit,
+    onMuteTurboAudioToggle: (Boolean) -> Unit,
+    onAutoSaveExitToggle: (Boolean) -> Unit,
     onSelectOrientation: (OrientationMode) -> Unit,
-    onLcdGridChange: (Float) -> Unit,
     onAudioToggle: (Boolean) -> Unit,
     onHapticsToggle: (Boolean) -> Unit,
     onOpacityChange: (Float) -> Unit,
@@ -66,6 +78,7 @@ fun ShaderAndSettingsSheet(
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val speedOptions = listOf(1.5f, 2f, 3f, 4f, 6f, 8f)
+    val effectiveSpeed = currentRom?.preferredSpeedMultiplier ?: preferences.fastForwardSpeed
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -80,68 +93,55 @@ fun ShaderAndSettingsSheet(
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
-                Text("SHADERS, SPEED (UP TO 8x) & SETTINGS", style = MaterialTheme.typography.titleLarge)
+                Text("EMULATOR SETTINGS & SPEED (8x)", style = MaterialTheme.typography.titleLarge)
             }
 
-            // Shaders Section
+            // Dedicated Shaders Manager Entry
             item {
-                SectionCard(title = "Display Shader Preset") {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        ShaderPreset.entries.forEach { preset ->
-                            val selected = preset == preferences.shaderPreset
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .border(
-                                        1.dp,
-                                        if (selected) LuminousViolet else BorderSubtle,
-                                        RoundedCornerShape(10.dp)
-                                    )
-                                    .clickable { onSelectShader(preset) }
-                                    .padding(10.dp)
-                                    .testTag("shader_option_${preset.name}"),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        preset.label,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (selected) LuminousViolet else Color.White
-                                    )
-                                    Text(preset.description, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
-                                }
-                                if (selected) {
-                                    Text("ACTIVE", style = MaterialTheme.typography.labelSmall, color = LuminousViolet)
-                                }
-                            }
-                        }
-
-                        if (preferences.shaderPreset == ShaderPreset.LCD3X ||
-                            preferences.shaderPreset == ShaderPreset.CRT_SCANLINES
-                        ) {
-                            Spacer(Modifier.height(6.dp))
+                SectionCard(title = "Display Shaders Studio") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                "Shader Grid / Scanline Intensity: ${(preferences.lcdGridIntensity * 100).toInt()}%",
+                                text = activeShaderProfile.name,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                            Text(
+                                text = if (currentRom?.preferredShaderProfileId != null) {
+                                    "Pinned to ${currentRom.title}"
+                                } else {
+                                    "Global active display shader"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )
-                            Slider(
-                                value = preferences.lcdGridIntensity,
-                                onValueChange = onLcdGridChange,
-                                valueRange = 0.1f..0.8f
-                            )
                         }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Button(
+                        onClick = onOpenShadersManager,
+                        colors = ButtonDefaults.buttonColors(containerColor = HandheldIndigo),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("open_shaders_manager_button")
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Open Shaders Manager (Live Preview & Import)", style = MaterialTheme.typography.labelLarge)
                     }
                 }
             }
 
-            // Fast-Forward Speed Section (up to 8x)
+            // Fast-Forward Speed Section (1.5x to 8x)
             item {
                 SectionCard(title = "Fast-Forward Speed & Pad Toggle") {
                     Text(
-                        "Target Speed Multiplier (up to 8x)",
+                        "Target Speed Multiplier (1.5x – 8x)",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary
                     )
@@ -151,11 +151,17 @@ fun ShaderAndSettingsSheet(
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         speedOptions.forEach { spd ->
-                            val selected = kotlin.math.abs(preferences.fastForwardSpeed - spd) < 0.2f
+                            val selected = abs(effectiveSpeed - spd) < 0.2f
                             val lbl = if (spd % 1f == 0f) "${spd.toInt()}x" else "${spd}x"
                             FilterChip(
                                 selected = selected,
-                                onClick = { onSelectSpeed(spd) },
+                                onClick = {
+                                    if (currentRom?.preferredSpeedMultiplier != null) {
+                                        onSetRomSpeedOverride(spd)
+                                    } else {
+                                        onSelectSpeed(spd)
+                                    }
+                                },
                                 label = { Text(lbl, style = MaterialTheme.typography.labelMedium) },
                                 colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = AmberBoost,
@@ -166,8 +172,43 @@ fun ShaderAndSettingsSheet(
                         }
                     }
 
-                    Spacer(Modifier.height(10.dp))
-                    Text("Speed Button Behavior (Beside Control Pad)", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                    if (currentRom != null) {
+                        Spacer(Modifier.height(8.dp))
+                        val isSpeedPinned = currentRom.preferredSpeedMultiplier != null
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                Icon(
+                                    Icons.Default.PushPin,
+                                    contentDescription = null,
+                                    tint = if (isSpeedPinned) AmberBoost else TextSecondary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = if (isSpeedPinned) "Speed pinned to ${currentRom.title}"
+                                    else "Pin speed to ${currentRom.title}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (isSpeedPinned) AmberBoost else TextSecondary
+                                )
+                            }
+                            if (isSpeedPinned) {
+                                TextButton(onClick = { onSetRomSpeedOverride(null) }) {
+                                    Text("Use Global", style = MaterialTheme.typography.labelSmall)
+                                }
+                            } else {
+                                TextButton(onClick = { onSetRomSpeedOverride(effectiveSpeed) }) {
+                                    Text("Pin Speed", style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Text("Speed Button Behavior (Beside D-Pad)", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         SpeedToggleMode.entries.forEach { mode ->
@@ -182,6 +223,12 @@ fun ShaderAndSettingsSheet(
                             )
                         }
                     }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Tip: Swipe any direction or long-press the SPD pad button to step 1.5x–8x on the fly.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary
+                    )
                 }
             }
 
@@ -204,9 +251,9 @@ fun ShaderAndSettingsSheet(
                 }
             }
 
-            // Audio & Controls
+            // Audio, Auto-Save & Controls
             item {
-                SectionCard(title = "Audio & Touch Ergonomics") {
+                SectionCard(title = "Audio, Auto-Save & Touch Ergonomics") {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -214,6 +261,42 @@ fun ShaderAndSettingsSheet(
                     ) {
                         Text("Audio Output (PSG + DirectSound)", style = MaterialTheme.typography.bodyMedium)
                         Switch(checked = preferences.audioEnabled, onCheckedChange = onAudioToggle)
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Soften / Mute Audio Above 2x", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "Prevents high-pitched audio clipping during 3x–8x turbo",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Switch(
+                            checked = preferences.muteTurboAudioAbove2x,
+                            onCheckedChange = onMuteTurboAudioToggle
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Auto-Save .ss0 on Exit / Pause", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "Resume instantly from the Library shelf",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Switch(
+                            checked = preferences.autoSaveOnExit,
+                            onCheckedChange = onAutoSaveExitToggle
+                        )
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),

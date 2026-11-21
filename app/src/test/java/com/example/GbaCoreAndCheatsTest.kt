@@ -9,6 +9,7 @@ import com.example.emulator.cheats.CheatDecoder
 import com.example.emulator.cheats.CheatFormat
 import com.example.emulator.cheats.ChtFileParser
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -59,12 +60,13 @@ class GbaCoreAndCheatsTest {
             cheat1_enable = false
         """.trimIndent()
 
-        val parsedLibretro = ChtFileParser.parse(libretroCht)
+        val parsedLibretro = ChtFileParser.parse(libretroCht, defaultGroup = "FireRed Pack")
         assertEquals(2, parsedLibretro.size)
         assertEquals("Max Coins", parsedLibretro[0].name)
+        assertEquals("FireRed Pack", parsedLibretro[0].groupName)
         assertTrue(parsedLibretro[0].enabled)
         assertEquals("Infinite HP", parsedLibretro[1].name)
-        assertTrue(!parsedLibretro[1].enabled)
+        assertFalse(parsedLibretro[1].enabled)
 
         val mgbaCheats = """
             # Max Score
@@ -85,5 +87,22 @@ class GbaCoreAndCheatsTest {
         CheatDecoder.executeAll(compiled, core.mmu)
         assertEquals(0x03E7, core.mmu.read16(0x02001000) and 0xFFFF)
         assertEquals(0x63, core.mmu.read8(0x02001010) and 0xFF)
+    }
+
+    @Test
+    fun cheatPreviewAndNormalizationDetectValidInvalidAndDuplicates() {
+        val validPreview = CheatDecoder.inspectPreview("82025840 0044\n32025842 0001", CheatFormat.AUTO)
+        assertTrue(validPreview.isValid)
+        assertEquals(2, validPreview.lineCount)
+        assertTrue(validPreview.summary.contains("0x02025840"))
+
+        val invalidPreview = CheatDecoder.inspectPreview("ZZZZZZZZ 1234", CheatFormat.CODEBREAKER)
+        assertFalse(invalidPreview.isValid)
+        assertEquals(1, invalidPreview.invalidLines.size)
+
+        assertEquals(
+            CheatDecoder.normalizeCodeKey("82001000 03e7"),
+            CheatDecoder.normalizeCodeKey("82001000:03E7\n")
+        )
     }
 }

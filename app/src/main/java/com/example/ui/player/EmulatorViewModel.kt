@@ -5,12 +5,14 @@ import android.graphics.Bitmap
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.CheatFileImportOutcome
 import com.example.data.EmulatorPreferences
 import com.example.data.PreferencesRepository
 import com.example.data.RomRepository
 import com.example.data.db.AppDatabase
 import com.example.data.db.CheatEntity
 import com.example.data.db.RomEntity
+import com.example.data.db.ShaderProfileEntity
 import com.example.data.savestate.SaveStateRepository
 import com.example.data.savestate.SaveStateSlotInfo
 import com.example.emulator.CoreTelemetry
@@ -19,26 +21,29 @@ import com.example.emulator.GbaCore
 import com.example.emulator.GbaRomMetadata
 import com.example.emulator.OrientationMode
 import com.example.emulator.SaveType
-import com.example.emulator.ShaderPreset
 import com.example.emulator.SpeedToggleMode
 import com.example.emulator.cheats.CheatDecoder
 import com.example.emulator.cheats.CheatFormat
 import com.example.emulator.cheats.ChtFileParser
 import com.example.emulator.cheats.CompiledCheat
-import com.example.emulator.cheats.ParsedChtEntry
 import com.example.emulator.cheats.ZipCheatCandidate
+import com.example.emulator.shaders.ShaderEngine
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.math.abs
 
 data class EmulatorUiState(
     val rom: RomEntity? = null,
@@ -48,11 +53,14 @@ data class EmulatorUiState(
     val isPaused: Boolean = false,
     val isTurboActive: Boolean = false,
     val currentSpeedMultiplier: Float = 1f,
+    val speedStepBanner: String? = null,
     val fps: Int = 0,
     val telemetry: CoreTelemetry? = null,
     val slots: List<SaveStateSlotInfo> = emptyList(),
     val cheats: List<CheatEntity> = emptyList(),
     val zipCandidates: List<ZipCheatCandidate> = emptyList(),
+    val shaderProfiles: List<ShaderProfileEntity> = emptyList(),
+    val activeShaderProfile: ShaderProfileEntity = ShaderEngine.builtInProfiles()[1],
     val preferences: EmulatorPreferences = EmulatorPreferences(),
     val toastMessage: String? = null
 )
@@ -65,6 +73,7 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
 
     private val core = GbaCore()
     private val lock = Any()
+    private val exitSaveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _uiState = MutableStateFlow(EmulatorUiState())
     val uiState: StateFlow<EmulatorUiState> = _uiState.asStateFlow()
@@ -75,24 +84,70 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     private var compiledCheats: List<CompiledCheat> = emptyList()
     private var emuJob: Job? = null
     private var cheatsObserveJob: Job? = null
+    private var bannerJob: Job? = null
     private var loadedRomId: Long = -1L
     private var sessionPlaySeconds: Long = 0L
+    private var lastAutoSaveAtMs: Long = 0L
+
+    private val speedLadder = listOf(1.5f, 2f, 3f, 4f, 6f, 8f)
 
     init {
         viewModelScope.launch {
-            prefsRepo.preferences.collectLatest { prefs ->
-                core.apu.enabled = prefs.audioEnabled
-                core.apu.volume = prefs.audioVolume
+            val seeded = romRepo.ensureBuiltInShaderProfiles()
+            val defaultLcd = seeded.firstOrNull { it.baseMode == "LCD3X" } ?: seeded.firstOrNull()
+
+            combine(
+                prefsRepo.preferences,
+                romRepo.observeShaderProfiles()
+            ) { prefs, profiles -> prefs to profiles }.collectLatest { (prefs, profiles) ->
+                if (prefs.activeShaderProfileId == 0L && defaultLcd != null) {
+                    prefsRepo.setActiveShaderProfileId(defaultLcd.id)
+                }
+
                 _uiState.update { state ->
-                    val mult = if (state.isTurboActive) prefs.fastForwardSpeed else 1f
-                    state.copy(preferences = prefs, currentSpeedMultiplier = mult)
+                    val targetSpeed = effectiveTargetSpeed(state.rom, prefs)
+                    val mult = if (state.isTurboActive) targetSpeed else 1f
+                    val resolvedProfile = resolveShaderProfile(state.rom, prefs, profiles)
+                    syncApuOutput(prefs, mult)
+                    state.copy(
+                        preferences = prefs,
+                        shaderProfiles = profiles,
+                        activeShaderProfile = resolvedProfile,
+                        currentSpeedMultiplier = mult
+                    )
                 }
             }
         }
     }
 
-    fun loadRomSession(romId: Long) {
-        if (loadedRomId == romId && core.isLoaded) return
+    private fun effectiveTargetSpeed(rom: RomEntity?, prefs: EmulatorPreferences): Float =
+        (rom?.preferredSpeedMultiplier ?: prefs.fastForwardSpeed).coerceIn(1.5f, 8f)
+
+    private fun resolveShaderProfile(
+        rom: RomEntity?,
+        prefs: EmulatorPreferences,
+        profiles: List<ShaderProfileEntity>
+    ): ShaderProfileEntity {
+        val preferredId = rom?.preferredShaderProfileId ?: prefs.activeShaderProfileId
+        return profiles.firstOrNull { it.id == preferredId }
+            ?: profiles.firstOrNull { it.baseMode == "LCD3X" }
+            ?: profiles.firstOrNull()
+            ?: ShaderEngine.builtInProfiles()[1]
+    }
+
+    private fun syncApuOutput(prefs: EmulatorPreferences, speedMultiplier: Float) {
+        val muteForTurbo = prefs.muteTurboAudioAbove2x && speedMultiplier > 2.0f
+        core.apu.enabled = prefs.audioEnabled && !muteForTurbo
+        core.apu.volume = prefs.audioVolume
+    }
+
+    fun loadRomSession(romId: Long, initialLoadSlot: Int = -1) {
+        if (loadedRomId == romId && core.isLoaded) {
+            if (initialLoadSlot in 0..9) {
+                loadFromSlot(initialLoadSlot)
+            }
+            return
+        }
         loadedRomId = romId
         sessionPlaySeconds = 0L
         emuJob?.cancel()
@@ -130,18 +185,47 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                         }
                     }
                 }
+
+                var resumeMessage: String? = null
+                if (initialLoadSlot in 0..9) {
+                    val slotRes = withContext(Dispatchers.Default) {
+                        synchronized(lock) {
+                            kotlinx.coroutines.runBlocking {
+                                saveRepo.loadFromSlot(rom.baseName, initialLoadSlot, rom.crc32Hex, core)
+                            }
+                        }
+                    }
+                    slotRes.onSuccess { info ->
+                        resumeMessage = "Resumed ${info.fileName} (PC ${info.pcHex})"
+                    }.onFailure { err ->
+                        resumeMessage = err.message
+                    }
+                }
+
                 core.apu.startAudioTrack()
                 romRepo.markPlayed(rom.id)
 
                 val slots = saveRepo.inspectAllSlots(rom.baseName, rom.crc32Hex)
-                _uiState.update {
-                    it.copy(
+                val bmp = Bitmap.createBitmap(
+                    core.ppu.frameBuffer,
+                    GbaConstants.SCREEN_WIDTH,
+                    GbaConstants.SCREEN_HEIGHT,
+                    Bitmap.Config.ARGB_8888
+                )
+                _frameBitmap.value = bmp
+
+                _uiState.update { state ->
+                    val resolvedProfile = resolveShaderProfile(rom, state.preferences, state.shaderProfiles)
+                    syncApuOutput(state.preferences, 1f)
+                    state.copy(
                         rom = rom,
                         metadata = meta,
                         isLoading = false,
                         isPaused = false,
                         slots = slots,
-                        telemetry = core.getTelemetry()
+                        activeShaderProfile = resolvedProfile,
+                        telemetry = core.getTelemetry(),
+                        toastMessage = resumeMessage ?: state.toastMessage
                     )
                 }
 
@@ -197,7 +281,6 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                 val frameStartNs = System.nanoTime()
                 synchronized(lock) {
                     if (steps == 1 && targetSpeed > 1.2f) {
-                        // 1.5x fractional step
                         core.stepFrame(renderPixels = true, speedMultiplier = targetSpeed)
                         if ((frameCounter and 1) == 0) {
                             core.stepFrame(renderPixels = false, speedMultiplier = targetSpeed)
@@ -243,7 +326,6 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                     }
                 }
 
-                // Target ~16.67ms frame pacing (for 1.5x -> ~11ms, for 2x..8x run max steps per vsync ~16ms)
                 val targetFrameNs = if (steps == 1 && targetSpeed > 1.2f) 11_111_000L else 16_666_000L
                 val elapsedNs = System.nanoTime() - frameStartNs
                 val sleepMs = (targetFrameNs - elapsedNs) / 1_000_000L
@@ -267,36 +349,95 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     fun toggleTurbo() {
         _uiState.update { state ->
             val nextTurbo = !state.isTurboActive
+            val target = effectiveTargetSpeed(state.rom, state.preferences)
+            val mult = if (nextTurbo) target else 1f
+            syncApuOutput(state.preferences, mult)
             state.copy(
                 isTurboActive = nextTurbo,
-                currentSpeedMultiplier = if (nextTurbo) state.preferences.fastForwardSpeed else 1f
+                currentSpeedMultiplier = mult
             )
         }
+        showSpeedBanner(
+            if (_uiState.value.isTurboActive) "TURBO ${formatSpeed(_uiState.value.currentSpeedMultiplier)}"
+            else "NORMAL 1x"
+        )
     }
 
     fun setTurboHeld(held: Boolean) {
         _uiState.update { state ->
+            val target = effectiveTargetSpeed(state.rom, state.preferences)
+            val mult = if (held) target else 1f
+            syncApuOutput(state.preferences, mult)
             state.copy(
                 isTurboActive = held,
-                currentSpeedMultiplier = if (held) state.preferences.fastForwardSpeed else 1f
+                currentSpeedMultiplier = mult
             )
         }
     }
 
-    fun cycleFastForwardSpeed() {
-        val steps = listOf(2f, 4f, 6f, 8f)
-        val cur = _uiState.value.preferences.fastForwardSpeed
-        val nextIdx = (steps.indexOfFirst { kotlin.math.abs(it - cur) < 0.25f } + 1) % steps.size
-        val nextSpeed = steps[nextIdx]
+    fun stepFastForwardSpeed(delta: Int) {
+        val state = _uiState.value
+        val cur = effectiveTargetSpeed(state.rom, state.preferences)
+        val curIdx = speedLadder.indices.minByOrNull { abs(speedLadder[it] - cur) } ?: 3
+        val stepOffset = if (delta >= 0) 1 else -1
+        val nextIdx = (curIdx + stepOffset + speedLadder.size) % speedLadder.size
+        val nextSpeed = speedLadder[nextIdx]
+
         viewModelScope.launch {
-            prefsRepo.setFastForwardSpeed(nextSpeed)
+            val rom = _uiState.value.rom
+            if (rom?.preferredSpeedMultiplier != null) {
+                romRepo.updateRomOverrides(rom.id, rom.preferredShaderProfileId, nextSpeed)
+                val updatedRom = rom.copy(preferredSpeedMultiplier = nextSpeed)
+                _uiState.update { s ->
+                    syncApuOutput(s.preferences, nextSpeed)
+                    s.copy(
+                        rom = updatedRom,
+                        isTurboActive = true,
+                        currentSpeedMultiplier = nextSpeed
+                    )
+                }
+            } else {
+                prefsRepo.setFastForwardSpeed(nextSpeed)
+                _uiState.update { s ->
+                    syncApuOutput(s.preferences, nextSpeed)
+                    s.copy(
+                        isTurboActive = true,
+                        currentSpeedMultiplier = nextSpeed
+                    )
+                }
+            }
+            showSpeedBanner("TURBO ${formatSpeed(nextSpeed)}")
+        }
+    }
+
+    fun setRomSpeedOverride(speed: Float?) {
+        val rom = _uiState.value.rom ?: return
+        viewModelScope.launch {
+            romRepo.updateRomOverrides(rom.id, rom.preferredShaderProfileId, speed)
+            val updatedRom = rom.copy(preferredSpeedMultiplier = speed)
             _uiState.update { state ->
+                val target = effectiveTargetSpeed(updatedRom, state.preferences)
+                val mult = if (state.isTurboActive) target else 1f
+                syncApuOutput(state.preferences, mult)
                 state.copy(
-                    isTurboActive = true,
-                    currentSpeedMultiplier = nextSpeed,
-                    toastMessage = "Fast-Forward speed set to ${nextSpeed.toInt()}x"
+                    rom = updatedRom,
+                    currentSpeedMultiplier = mult,
+                    toastMessage = if (speed != null) {
+                        "Pinned ${formatSpeed(speed)} speed to ${rom.title}"
+                    } else {
+                        "Using global turbo speed for ${rom.title}"
+                    }
                 )
             }
+        }
+    }
+
+    private fun showSpeedBanner(label: String) {
+        bannerJob?.cancel()
+        _uiState.update { it.copy(speedStepBanner = label) }
+        bannerJob = viewModelScope.launch {
+            delay(1200L)
+            _uiState.update { it.copy(speedStepBanner = null) }
         }
     }
 
@@ -424,7 +565,13 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
 
     // === CHEATS & .CHT PACKAGES ===
 
-    fun addOrEditCheat(existingId: Long = 0L, name: String, code: String, format: CheatFormat) {
+    fun addOrEditCheat(
+        existingId: Long = 0L,
+        name: String,
+        code: String,
+        format: CheatFormat,
+        groupName: String = "Manual"
+    ) {
         val rom = _uiState.value.rom ?: return
         if (name.isBlank() || code.isBlank()) return
         viewModelScope.launch {
@@ -436,7 +583,8 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                     code = code.trim(),
                     formatName = format.name,
                     enabled = true,
-                    sourceFormat = "Manual"
+                    sourceFormat = "Manual",
+                    groupName = groupName.trim().ifBlank { "Manual" }
                 )
             )
             _uiState.update { it.copy(toastMessage = "Saved cheat: ${name.trim()}") }
@@ -446,6 +594,13 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     fun toggleCheat(cheat: CheatEntity) {
         viewModelScope.launch {
             romRepo.setCheatEnabled(cheat, !cheat.enabled)
+        }
+    }
+
+    fun toggleCheatGroup(groupName: String, enabled: Boolean) {
+        val rom = _uiState.value.rom ?: return
+        viewModelScope.launch {
+            romRepo.setGroupCheatsEnabled(rom.id, groupName, enabled)
         }
     }
 
@@ -464,45 +619,37 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
 
     fun importCheatFileFromUri(uri: Uri) {
         val rom = _uiState.value.rom ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                val rawBytes = getApplication<Application>().contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                    ?: error("Cannot read cheat file.")
-
-                val isZip = rawBytes.size >= 4 && rawBytes[0] == 0x50.toByte() && rawBytes[1] == 0x4B.toByte()
-                if (isZip) {
-                    val candidates = ChtFileParser.scanZipCheatPack(rawBytes, rom.title, rom.gameCode)
-                    if (candidates.isEmpty()) {
-                        error("No .cht / .cheats files found inside archive.")
-                    } else if (candidates.size == 1) {
-                        val parsed = ChtFileParser.parse(candidates.first().contentText)
-                        romRepo.importParsedCheats(rom.id, parsed)
-                        _uiState.update { it.copy(toastMessage = "Imported ${parsed.size} cheats from ${candidates.first().entryName}") }
-                    } else {
-                        _uiState.update { it.copy(zipCandidates = candidates) }
+        viewModelScope.launch {
+            romRepo.importCheatFileFromUri(uri, rom)
+                .onSuccess { outcome ->
+                    when (outcome) {
+                        is CheatFileImportOutcome.Imported -> {
+                            val s = outcome.summary
+                            val dupNote = if (s.skippedDuplicates > 0) " (${s.skippedDuplicates} duplicates skipped)" else ""
+                            _uiState.update { it.copy(toastMessage = "Imported ${s.addedCount} cheats (${s.sourceLabel})$dupNote") }
+                        }
+                        is CheatFileImportOutcome.NeedsZipSelection -> {
+                            _uiState.update { it.copy(zipCandidates = outcome.candidates) }
+                        }
                     }
-                } else {
-                    val text = rawBytes.toString(Charsets.UTF_8)
-                    val parsed = ChtFileParser.parse(text, rom.title)
-                    require(parsed.isNotEmpty()) { "No valid cheat codes found in file." }
-                    romRepo.importParsedCheats(rom.id, parsed)
-                    _uiState.update { it.copy(toastMessage = "Imported ${parsed.size} cheats (${parsed.first().sourceFormat})") }
                 }
-            }.onFailure { err ->
-                _uiState.update { it.copy(toastMessage = err.message ?: "Cheat import failed.") }
-            }
+                .onFailure { err ->
+                    _uiState.update { it.copy(toastMessage = err.message ?: "Cheat import failed.") }
+                }
         }
     }
 
     fun importZipCandidate(candidate: ZipCheatCandidate) {
         val rom = _uiState.value.rom ?: return
         viewModelScope.launch {
-            val parsed = ChtFileParser.parse(candidate.contentText)
-            romRepo.importParsedCheats(rom.id, parsed)
+            val group = candidate.entryName.substringAfterLast('/').substringBeforeLast('.').ifBlank { "ZIP Pack" }
+            val parsed = ChtFileParser.parse(candidate.contentText, rom.title, group)
+            val summary = romRepo.importParsedCheats(rom.id, parsed, group)
+            val dupNote = if (summary.skippedDuplicates > 0) " (${summary.skippedDuplicates} dup skipped)" else ""
             _uiState.update {
                 it.copy(
                     zipCandidates = emptyList(),
-                    toastMessage = "Imported ${parsed.size} cheats from ${candidate.entryName.substringAfterLast('/')}"
+                    toastMessage = "Imported ${summary.addedCount} cheats from $group$dupNote"
                 )
             }
         }
@@ -514,45 +661,136 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
 
     fun exportCheatsToUri(uri: Uri) {
         val cheats = _uiState.value.cheats
-        viewModelScope.launch(Dispatchers.IO) {
-            if (cheats.isEmpty()) {
-                _uiState.update { it.copy(toastMessage = "No cheats to export.") }
-                return@launch
-            }
-            val parsed = cheats.map {
-                ParsedChtEntry(
-                    name = it.name,
-                    code = it.code,
-                    format = runCatching { CheatFormat.valueOf(it.formatName) }.getOrDefault(CheatFormat.AUTO),
-                    enabled = it.enabled,
-                    sourceFormat = it.sourceFormat
+        viewModelScope.launch {
+            romRepo.exportCheatsToUri(cheats, uri)
+                .onSuccess { count ->
+                    _uiState.update { it.copy(toastMessage = "Exported $count cheats (.cht)") }
+                }
+                .onFailure { err ->
+                    _uiState.update { it.copy(toastMessage = err.message ?: "Export failed.") }
+                }
+        }
+    }
+
+    // === SHADERS STUDIO & SETTINGS ===
+
+    fun selectGlobalShaderProfile(profile: ShaderProfileEntity) {
+        viewModelScope.launch {
+            prefsRepo.setActiveShaderProfileId(profile.id)
+            _uiState.update { state ->
+                val resolved = if (state.rom?.preferredShaderProfileId == null) profile else state.activeShaderProfile
+                state.copy(
+                    activeShaderProfile = resolved,
+                    toastMessage = "Global shader: ${profile.name}"
                 )
-            }
-            val text = ChtFileParser.exportToLibretroCht(parsed)
-            runCatching {
-                getApplication<Application>().contentResolver.openOutputStream(uri)?.use {
-                    it.write(text.toByteArray(Charsets.UTF_8))
-                } ?: error("Cannot write .cht file.")
-            }.onSuccess {
-                _uiState.update { it.copy(toastMessage = "Exported ${cheats.size} cheats (.cht)") }
-            }.onFailure { err ->
-                _uiState.update { it.copy(toastMessage = err.message ?: "Export failed.") }
             }
         }
     }
 
-    // === SHADERS & SETTINGS ===
+    fun pinShaderToCurrentRom(shaderProfileId: Long?) {
+        val rom = _uiState.value.rom ?: return
+        viewModelScope.launch {
+            romRepo.updateRomOverrides(rom.id, shaderProfileId, rom.preferredSpeedMultiplier)
+            val updatedRom = rom.copy(preferredShaderProfileId = shaderProfileId)
+            _uiState.update { state ->
+                val resolved = resolveShaderProfile(updatedRom, state.preferences, state.shaderProfiles)
+                state.copy(
+                    rom = updatedRom,
+                    activeShaderProfile = resolved,
+                    toastMessage = if (shaderProfileId != null) {
+                        "Pinned ${resolved.name} to ${rom.title}"
+                    } else {
+                        "Using global shader for ${rom.title}"
+                    }
+                )
+            }
+        }
+    }
 
-    fun setShader(preset: ShaderPreset) = viewModelScope.launch { prefsRepo.setShader(preset) }
-    fun setFastForwardSpeed(speed: Float) = viewModelScope.launch { prefsRepo.setFastForwardSpeed(speed) }
-    fun setSpeedToggleMode(mode: SpeedToggleMode) = viewModelScope.launch { prefsRepo.setSpeedToggleMode(mode) }
-    fun setOrientationMode(mode: OrientationMode) = viewModelScope.launch { prefsRepo.setOrientationMode(mode) }
-    fun setAudioEnabled(enabled: Boolean) = viewModelScope.launch { prefsRepo.setAudioEnabled(enabled) }
-    fun setHapticsEnabled(enabled: Boolean) = viewModelScope.launch { prefsRepo.setHapticsEnabled(enabled) }
-    fun setControlOpacity(opacity: Float) = viewModelScope.launch { prefsRepo.setControlOpacity(opacity) }
-    fun setControlScale(scale: Float) = viewModelScope.launch { prefsRepo.setControlScale(scale) }
-    fun setMasterCheatsEnabled(enabled: Boolean) = viewModelScope.launch { prefsRepo.setMasterCheatsEnabled(enabled) }
-    fun setLcdGridIntensity(intensity: Float) = viewModelScope.launch { prefsRepo.setLcdGridIntensity(intensity) }
+    fun saveShaderProfile(profile: ShaderProfileEntity) {
+        viewModelScope.launch {
+            val savedId = romRepo.saveShaderProfile(profile)
+            prefsRepo.setActiveShaderProfileId(savedId)
+            _uiState.update { it.copy(toastMessage = "Saved shader profile: ${profile.name}") }
+        }
+    }
+
+    fun deleteCustomShaderProfile(profileId: Long) {
+        viewModelScope.launch {
+            val rom = _uiState.value.rom
+            if (rom?.preferredShaderProfileId == profileId) {
+                romRepo.updateRomOverrides(rom.id, null, rom.preferredSpeedMultiplier)
+                _uiState.update { it.copy(rom = rom.copy(preferredShaderProfileId = null)) }
+            }
+            romRepo.deleteCustomShaderProfile(profileId)
+            val all = romRepo.ensureBuiltInShaderProfiles()
+            if (_uiState.value.preferences.activeShaderProfileId == profileId && all.isNotEmpty()) {
+                prefsRepo.setActiveShaderProfileId(all.first().id)
+            }
+            _uiState.update { it.copy(toastMessage = "Deleted custom shader profile") }
+        }
+    }
+
+    fun importShaderFile(uri: Uri) {
+        viewModelScope.launch {
+            romRepo.importShaderFromUri(uri)
+                .onSuccess { saved ->
+                    prefsRepo.setActiveShaderProfileId(saved.id)
+                    _uiState.update { it.copy(toastMessage = "Imported shader: ${saved.name}") }
+                }
+                .onFailure { err ->
+                    _uiState.update { it.copy(toastMessage = err.message ?: "Failed to import shader.") }
+                }
+        }
+    }
+
+    fun exportShaderProfile(profile: ShaderProfileEntity, uri: Uri) {
+        viewModelScope.launch {
+            romRepo.exportShaderToUri(profile, uri)
+                .onSuccess { _uiState.update { it.copy(toastMessage = "Exported shader profile: ${profile.name}") } }
+                .onFailure { err -> _uiState.update { it.copy(toastMessage = err.message ?: "Export failed.") } }
+        }
+    }
+
+    fun setFastForwardSpeed(speed: Float) = viewModelScope.launch {
+        prefsRepo.setFastForwardSpeed(speed)
+    }
+
+    fun setSpeedToggleMode(mode: SpeedToggleMode) = viewModelScope.launch {
+        prefsRepo.setSpeedToggleMode(mode)
+    }
+
+    fun setOrientationMode(mode: OrientationMode) = viewModelScope.launch {
+        prefsRepo.setOrientationMode(mode)
+    }
+
+    fun setAudioEnabled(enabled: Boolean) = viewModelScope.launch {
+        prefsRepo.setAudioEnabled(enabled)
+    }
+
+    fun setMuteTurboAudioAbove2x(enabled: Boolean) = viewModelScope.launch {
+        prefsRepo.setMuteTurboAudioAbove2x(enabled)
+    }
+
+    fun setAutoSaveOnExit(enabled: Boolean) = viewModelScope.launch {
+        prefsRepo.setAutoSaveOnExit(enabled)
+    }
+
+    fun setHapticsEnabled(enabled: Boolean) = viewModelScope.launch {
+        prefsRepo.setHapticsEnabled(enabled)
+    }
+
+    fun setControlOpacity(opacity: Float) = viewModelScope.launch {
+        prefsRepo.setControlOpacity(opacity)
+    }
+
+    fun setControlScale(scale: Float) = viewModelScope.launch {
+        prefsRepo.setControlScale(scale)
+    }
+
+    fun setMasterCheatsEnabled(enabled: Boolean) = viewModelScope.launch {
+        prefsRepo.setMasterCheatsEnabled(enabled)
+    }
 
     fun importBios(uri: Uri) {
         viewModelScope.launch {
@@ -579,9 +817,22 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun flushAndPause() {
-        val rom = _uiState.value.rom ?: return
+        val state = _uiState.value
+        val rom = state.rom ?: return
+        val meta = state.metadata
         _uiState.update { it.copy(isPaused = true) }
-        viewModelScope.launch {
+
+        val now = System.currentTimeMillis()
+        val shouldAutoSave = state.preferences.autoSaveOnExit &&
+            core.isLoaded &&
+            meta != null &&
+            (now - lastAutoSaveAtMs > 500L)
+
+        if (shouldAutoSave) {
+            lastAutoSaveAtMs = now
+        }
+
+        exitSaveScope.launch {
             if (core.mmu.sramDirty) {
                 val copy = synchronized(lock) {
                     core.mmu.sramDirty = false
@@ -589,15 +840,30 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                 }
                 saveRepo.saveBatterySram(rom.baseName, copy)
             }
+            if (shouldAutoSave && meta != null) {
+                val totalPlay = rom.totalPlaySeconds + sessionPlaySeconds
+                val saveRes = synchronized(lock) {
+                    kotlinx.coroutines.runBlocking {
+                        saveRepo.saveToSlot(rom.baseName, 0, meta, totalPlay, core)
+                    }
+                }
+                saveRes.onSuccess {
+                    romRepo.recordSaveCreated(rom.id, 0)
+                }
+            }
         }
     }
 
     override fun onCleared() {
         emuJob?.cancel()
         cheatsObserveJob?.cancel()
+        bannerJob?.cancel()
         core.apu.release()
         super.onCleared()
     }
+
+    private fun formatSpeed(spd: Float): String =
+        if (spd % 1f == 0f) "${spd.toInt()}x" else "${spd}x"
 
     private fun formatBytes(bytes: Long): String = when {
         bytes >= 1024 * 1024 -> String.format("%.2f MB", bytes / (1024f * 1024f))
