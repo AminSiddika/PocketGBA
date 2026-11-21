@@ -21,6 +21,15 @@ class GbaMmu {
     private var flashState = 0
     private var flashIdMode = false
 
+    // EEPROM state machine (512B / 8KB at 0x0Dxxxxxx)
+    private var eepromMode = 0 // 0=IDLE (returns 1 ready bit), 1=READ_DATA
+    private var eepromAddrBits = 14 // Auto-detected: 6 (512B) or 14 (8KB)
+    private var eepromReadAddr = 0
+    private var eepromReadBitPos = 0
+    private val eepromBitBuf = IntArray(96)
+    private var eepromBitLen = 0
+    private var activeEepromDmaCount = 0
+
     // Keypad state (active low, bit 0..9)
     @Volatile
     var keyInput: Int = GbaConstants.KEY_ALL_RELEASED
@@ -86,6 +95,12 @@ class GbaMmu {
         flashBank = 0
         flashState = 0
         flashIdMode = false
+        eepromMode = 0
+        eepromAddrBits = 14
+        eepromReadAddr = 0
+        eepromReadBitPos = 0
+        eepromBitLen = 0
+        activeEepromDmaCount = 0
         halted = false
         intrWaitMask = 0
         waitingForIntr = false
@@ -162,7 +177,9 @@ class GbaMmu {
             0x07 -> oam[address and 0x3FF].toInt() and 0xFF
             0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D -> {
                 val off = address and 0x01FFFFFF
-                if ((gpioControl and 1) != 0 && off in 0xC4..0xC9) {
+                if (isEepromAccess(region, off)) {
+                    if ((address and 1) == 0) readEeprom16() and 0xFF else 0
+                } else if ((gpioControl and 1) != 0 && off in 0xC4..0xC9) {
                     readGpioHalfword(off and 0xFFFFFFFE.toInt()) ushr ((address and 1) * 8) and 0xFF
                 } else if (off < rom.size) rom[off].toInt() and 0xFF else ((off ushr 1) and 0xFF)
             }
@@ -203,7 +220,9 @@ class GbaMmu {
             }
             0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D -> {
                 val o = aligned and 0x01FFFFFF
-                if ((gpioControl and 1) != 0 && (o == 0xC4 || o == 0xC6 || o == 0xC8)) {
+                if (isEepromAccess(region, o)) {
+                    readEeprom16()
+                } else if ((gpioControl and 1) != 0 && (o == 0xC4 || o == 0xC6 || o == 0xC8)) {
                     readGpioHalfword(o)
                 } else if (o + 1 < rom.size) {
                     (rom[o].toInt() and 0xFF) or ((rom[o + 1].toInt() and 0xFF) shl 8)
@@ -272,12 +291,23 @@ class GbaMmu {
             }
             0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D -> {
                 val o = aligned and 0x01FFFFFF
-                if (o + 3 < rom.size) {
+                if (isEepromAccess(region, o)) {
+                    readEeprom16()
+                } else if (o + 3 < rom.size) {
                     (rom[o].toInt() and 0xFF) or
                         ((rom[o + 1].toInt() and 0xFF) shl 8) or
                         ((rom[o + 2].toInt() and 0xFF) shl 16) or
                         ((rom[o + 3].toInt() and 0xFF) shl 24)
-                } else 0
+                } else if (o < rom.size) {
+                    var res = 0
+                    for (b in 0..3) {
+                        val byteVal = if (o + b < rom.size) (rom[o + b].toInt() and 0xFF) else 0
+                        res = res or (byteVal shl (b * 8))
+                    }
+                    res
+                } else {
+                    ((o ushr 1) and 0xFFFF) or ((((o + 2) ushr 1) and 0xFFFF) shl 16)
+                }
             }
             0x0E, 0x0F -> {
                 val v = readSram8(aligned and 0xFFFF)
@@ -354,9 +384,11 @@ class GbaMmu {
                 oam[o] = b0
                 oam[o + 1] = b1
             }
-            0x08, 0x09 -> {
+            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D -> {
                 val o = aligned and 0x01FFFFFF
-                if (o == 0xC4 || o == 0xC6 || o == 0xC8) {
+                if (isEepromAccess(region, o)) {
+                    writeEeprom16(value)
+                } else if ((region == 0x08 || region == 0x09) && (o == 0xC4 || o == 0xC6 || o == 0xC8)) {
                     writeGpioHalfword(o, value and 0xFFFF)
                 }
             }
@@ -456,6 +488,38 @@ class GbaMmu {
     private fun writeIo8(offset: Int, value: Int) {
         val o = offset and 0x3FF
         when (o) {
+            0x004 -> {
+                val ro = io[0x004].toInt() and 0x07
+                io[0x004] = ((value and 0xF8) or ro).toByte()
+                return
+            }
+            0x006, 0x007 -> return
+            0x100, 0x101, 0x104, 0x105, 0x108, 0x109, 0x10C, 0x10D -> {
+                val base = o and 0x3FE
+                val idx = (base - 0x100) ushr 2
+                io[o] = value.toByte()
+                timerReload[idx] = readIo16Raw(base)
+                return
+            }
+            0x102, 0x103, 0x106, 0x107, 0x10A, 0x10B, 0x10E, 0x10F -> {
+                val base = o and 0x3FE
+                val idx = (base - 0x102) ushr 2
+                val prevEnabled = (timerControl[idx] and 0x80) != 0
+                io[o] = value.toByte()
+                val newCtrl = readIo16Raw(base)
+                val nowEnabled = (newCtrl and 0x80) != 0
+                timerControl[idx] = newCtrl
+                if (!prevEnabled && nowEnabled) {
+                    timerCounter[idx] = timerReload[idx]
+                    timerSubCycles[idx] = 0
+                }
+                return
+            }
+            0x132, 0x133 -> {
+                io[o] = value.toByte()
+                checkKeypadIrq()
+                return
+            }
             0x202, 0x203 -> {
                 // IF is write-1-to-clear
                 val cur = io[o].toInt() and 0xFF
@@ -485,6 +549,11 @@ class GbaMmu {
                 return
             }
             0x006 -> return // VCOUNT is read-only
+            0x132 -> {
+                writeIo16Raw(0x132, value and 0xC3FF)
+                checkKeypadIrq()
+                return
+            }
             0x202 -> {
                 // IF write-1-to-clear
                 val cur = readIo16Raw(0x202)
@@ -649,6 +718,9 @@ class GbaMmu {
 
         var src = dmaInternalSad[ch]
         var dst = dmaInternalDad[ch]
+        if (ch == 3 && ((dst ushr 24) and 0xFF) == 0x0D) {
+            activeEepromDmaCount = count
+        }
 
         for (i in 0 until count) {
             if (word32) {
@@ -659,6 +731,7 @@ class GbaMmu {
             src += srcStep
             dst += dstStep
         }
+        activeEepromDmaCount = 0
 
         dmaInternalSad[ch] = src
         dmaInternalDad[ch] = if (dstMode == 3) dmaDad[ch] else dst
@@ -738,6 +811,103 @@ class GbaMmu {
         val ie = readIo16Raw(0x200)
         val irqFlags = readIo16Raw(0x202)
         return (ie and irqFlags) != 0
+    }
+
+    fun checkKeypadIrq() {
+        val keycnt = readIo16Raw(0x132)
+        if ((keycnt and 0x4000) == 0) return
+        val selected = keycnt and 0x03FF
+        if (selected == 0) return
+        val pressed = keyInput.inv() and 0x03FF
+        val triggered = if ((keycnt and 0x8000) != 0) {
+            (pressed and selected) == selected
+        } else {
+            (pressed and selected) != 0
+        }
+        if (triggered) {
+            raiseIrq(GbaConstants.IRQ_KEYPAD)
+        }
+    }
+
+    private fun isEepromAccess(region: Int, romOffset: Int): Boolean {
+        if (region != 0x0D) return false
+        return rom.size <= 0x01000000 || romOffset >= 0x01FFFF00
+    }
+
+    private fun readEeprom16(): Int {
+        if (eepromMode == 0) return 1 // Ready bit
+        val pos = eepromReadBitPos++
+        if (pos < 4) return 0 // 4 dummy zero bits
+        val dataBitIdx = pos - 4
+        if (dataBitIdx >= 64) {
+            eepromMode = 0
+            eepromReadBitPos = 0
+            return 1
+        }
+        val byteIdx = dataBitIdx ushr 3
+        val bitInByte = 7 - (dataBitIdx and 7)
+        val sramOffset = ((eepromReadAddr and 0x3FF) * 8 + byteIdx) and 0x1FFF
+        val bit = (sram[sramOffset].toInt() ushr bitInByte) and 1
+        if (dataBitIdx == 63) {
+            eepromMode = 0
+            eepromReadBitPos = 0
+        }
+        return bit
+    }
+
+    private fun writeEeprom16(value: Int) {
+        if (eepromBitLen == 0) {
+            when (activeEepromDmaCount) {
+                9, 73 -> eepromAddrBits = 6
+                17, 81 -> eepromAddrBits = 14
+            }
+        }
+        if (eepromBitLen < eepromBitBuf.size) {
+            eepromBitBuf[eepromBitLen++] = value and 1
+        }
+        if (eepromBitLen < 2) return
+        val cmd = (eepromBitBuf[0] shl 1) or eepromBitBuf[1]
+        when (cmd) {
+            0b11 -> { // Read request: 2 cmd bits + addrBits + 1 trailing bit
+                val totalLen = 2 + eepromAddrBits + 1
+                if (eepromBitLen >= totalLen) {
+                    var addr = 0
+                    for (i in 0 until eepromAddrBits) {
+                        addr = (addr shl 1) or eepromBitBuf[2 + i]
+                    }
+                    eepromReadAddr = addr
+                    eepromReadBitPos = 0
+                    eepromMode = 1
+                    eepromBitLen = 0
+                }
+            }
+            0b10 -> { // Write request: 2 cmd bits + addrBits + 64 data bits + 1 trailing bit
+                val totalLen = 2 + eepromAddrBits + 64 + 1
+                if (eepromBitLen >= totalLen) {
+                    var addr = 0
+                    for (i in 0 until eepromAddrBits) {
+                        addr = (addr shl 1) or eepromBitBuf[2 + i]
+                    }
+                    val baseOffset = (addr and 0x3FF) * 8
+                    val dataStart = 2 + eepromAddrBits
+                    for (byteIdx in 0 until 8) {
+                        var b = 0
+                        for (bit in 0 until 8) {
+                            b = (b shl 1) or eepromBitBuf[dataStart + byteIdx * 8 + bit]
+                        }
+                        sram[(baseOffset + byteIdx) and 0x1FFF] = b.toByte()
+                    }
+                    sramDirty = true
+                    eepromMode = 0
+                    eepromBitLen = 0
+                }
+            }
+            else -> {
+                // Invalid command prefix, reset bit stream
+                eepromBitLen = 0
+                eepromMode = 0
+            }
+        }
     }
 
     private fun readSram8(offset: Int): Int {

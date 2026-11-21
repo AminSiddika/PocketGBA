@@ -61,6 +61,22 @@ class Arm7TdmiCpu(
         totalCycles = 0L
     }
 
+    fun softReset(bootToEwram: Boolean = false) {
+        r.fill(0)
+        usrBank8_14.fill(0)
+        fiqBank8_14.fill(0)
+        irqBank13_14.fill(0)
+        svcBank13_14.fill(0)
+        abtBank13_14.fill(0)
+        undBank13_14.fill(0)
+        spsr.fill(0)
+        irqBank13_14[0] = 0x03007FA0
+        svcBank13_14[0] = 0x03007FE0
+        cpsr = MODE_SYS
+        r[13] = 0x03007F00
+        r[15] = if (bootToEwram) 0x02000000 else 0x08000000
+    }
+
     val isThumb: Boolean get() = (cpsr and FLAG_T) != 0
 
     fun currentModeName(): String = when (cpsr and 0x1F) {
@@ -282,7 +298,8 @@ class Arm7TdmiCpu(
             }
             7 -> {
                 if ((op and 0x0F000000) == 0x0F000000) {
-                    bios.handleSwi(op and 0x00FFFFFF, this)
+                    val swiNum = if ((op and 0x00FF0000) != 0) (op ushr 16) and 0xFF else op and 0xFF
+                    bios.handleSwi(swiNum, this)
                     return 3
                 }
             }
@@ -579,7 +596,7 @@ class Arm7TdmiCpu(
 
         if (load) {
             val value = when (sh) {
-                1 -> mmu.read16(addr)
+                1 -> Integer.rotateRight(mmu.read16(addr), (addr and 1) * 8)
                 2 -> mmu.read8(addr).toByte().toInt()
                 else -> if ((addr and 1) == 0) mmu.read16(addr).toShort().toInt() else mmu.read8(addr).toByte().toInt()
             }
@@ -616,13 +633,15 @@ class Arm7TdmiCpu(
         val userBank = sBit && (!load || (rlist and 0x8000) == 0)
         if (userBank) switchMode(MODE_USR)
 
+        var loadedPc: Int? = null
+        var restoreSpsrOnPc = false
         for (i in 0..15) {
             if ((rlist and (1 shl i)) != 0) {
                 if (load) {
                     val v = mmu.read32(addr)
                     if (i == 15) {
-                        if (sBit) setCpsrWithMode(getSpsr())
-                        r[15] = v and 0xFFFFFFFC.toInt()
+                        loadedPc = v
+                        restoreSpsrOnPc = sBit
                     } else {
                         r[i] = v
                     }
@@ -636,6 +655,14 @@ class Arm7TdmiCpu(
         if (userBank) switchMode(savedMode)
         if (writeback && (!load || (rlist and (1 shl rnIdx)) == 0)) {
             r[rnIdx] = finalBase
+        }
+        if (loadedPc != null) {
+            if (restoreSpsrOnPc) setCpsrWithMode(getSpsr())
+            r[15] = if ((cpsr and FLAG_T) != 0) {
+                loadedPc and 0xFFFFFFFE.toInt()
+            } else {
+                loadedPc and 0xFFFFFFFC.toInt()
+            }
         }
         return count + 2
     }

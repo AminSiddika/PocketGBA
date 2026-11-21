@@ -52,8 +52,9 @@ class GbaCore {
         isLoaded = true
     }
 
-    fun setKeys(keyMask: Int) {
-        mmu.keyInput = keyMask and 0x03FF
+    fun setKeys(pressedMask: Int) {
+        mmu.keyInput = GbaConstants.KEY_ALL_RELEASED and (pressedMask and 0x03FF).inv()
+        mmu.checkKeypadIrq()
     }
 
     fun stepFrame(renderPixels: Boolean, speedMultiplier: Float) {

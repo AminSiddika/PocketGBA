@@ -75,7 +75,10 @@ object ThumbExecutor {
                             2 -> cpu.mmu.write8(addr, cpu.r[rd])
                             3 -> cpu.r[rd] = cpu.mmu.read8(addr).toByte().toInt()
                             4 -> cpu.r[rd] = Integer.rotateRight(cpu.mmu.read32(addr), (addr and 3) * 8)
-                            5 -> cpu.r[rd] = cpu.mmu.read16(addr)
+                            5 -> {
+                                val hw = cpu.mmu.read16(addr)
+                                cpu.r[rd] = Integer.rotateRight(hw, (addr and 1) * 8)
+                            }
                             6 -> cpu.r[rd] = cpu.mmu.read8(addr)
                             7 -> cpu.r[rd] = if ((addr and 1) == 0) cpu.mmu.read16(addr).toShort().toInt() else cpu.mmu.read8(addr).toByte().toInt()
                         }
@@ -112,7 +115,10 @@ object ThumbExecutor {
                     val rb = (op ushr 3) and 7
                     val rd = op and 7
                     val addr = cpu.r[rb] + imm5
-                    if (isLoad) cpu.r[rd] = cpu.mmu.read16(addr) else cpu.mmu.write16(addr, cpu.r[rd])
+                    if (isLoad) {
+                        val hw = cpu.mmu.read16(addr)
+                        cpu.r[rd] = Integer.rotateRight(hw, (addr and 1) * 8)
+                    } else cpu.mmu.write16(addr, cpu.r[rd])
                 }
                 return 2
             }
