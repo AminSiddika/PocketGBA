@@ -973,11 +973,11 @@ class EmulatorViewModel(application: Application) : AndroidViewModel(application
                 }
                 saveRepo.saveBatterySram(rom.baseName, copy)
             }
-            if (shouldAutoSave && meta != null) {
+            if (shouldAutoSave) {
                 val totalPlay = rom.totalPlaySeconds + sessionPlaySeconds
                 val saveRes = synchronized(lock) {
                     kotlinx.coroutines.runBlocking {
-                        saveRepo.saveToSlot(rom.baseName, 0, meta, totalPlay, core)
+                        saveRepo.saveToSlot(rom.baseName, 0, meta!!, totalPlay, core)
                     }
                 }
                 saveRes.onSuccess {
