@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">PocketAdvance</string>
+    <string name="library_title">Cartridge Shelf</string>
+    <string name="library_subtitle">Pure-Kotlin GBA Core • HLE BIOS</string>
+    <string name="import_rom">Import ROM (.gba)</string>
+    <string name="launch_demo">Launch Homebrew Demo</string>
+    <string name="empty_library_title">No Cartridges Loaded</string>
+    <string name="empty_library_desc">Import a .gba or .zip ROM from device storage, or launch the built-in ARM7TDMI homebrew demo to test shaders, 8x turbo, cheats, and .ss1/.ss2 save states.</string>
+    <string name="save_states_title">Save States (.ss1–.ss9)</string>
+    <string name="cheats_title">Cheat Manager (.cht)</string>
+    <string name="shaders_title">Display Shaders</string>
+    <string name="settings_title">Console Settings</string>
+</resources>

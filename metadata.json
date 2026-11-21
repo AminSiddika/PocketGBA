@@ -1,0 +1,6 @@
+{
+  "name": "PocketAdvance",
+  "description": "Pure-Kotlin Game Boy Advance emulator with .ss1/.ss2 save states, multi-format .cht cheats, shaders, 8x fast-forward, and landscape support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
